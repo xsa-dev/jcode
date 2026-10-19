@@ -2,8 +2,9 @@
 
 use super::{
     App, DisplayMessage, MAX_TURN_HOLD_SECS, PendingReloadReconnectStatus, ProcessingStatus,
-    RemoteResumeActivity, SendAction, ctrl_bracket_fallback_to_esc, input, parse_rate_limit_error,
-    remote_notifications::present_swarm_notification, spawn_in_new_terminal,
+    RemoteResumeActivity, SendAction, auth::auth_muse_helpers, ctrl_bracket_fallback_to_esc, input,
+    parse_rate_limit_error, remote_notifications::present_swarm_notification,
+    spawn_in_new_terminal,
 };
 use crate::bus::BusEvent;
 use crate::message::ToolCall;
@@ -733,7 +734,7 @@ pub(super) async fn handle_bus_event(
                 app.set_status_notice("Local login does not change SSH server credentials");
                 return true;
             }
-            let success = login.success && login.provider != "copilot_code";
+            let success = login.success && auth_muse_helpers::is_completed_login(&login);
             let provider_hint = auth_provider_hint_for_login_provider(&login.provider);
             let auth = auth_changed_event_for_login_provider(&login.provider);
             let prefer_strongest = success && app.onboarding_should_prefer_strongest_model();
@@ -1522,8 +1523,7 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
     }
 
     if app.take_pending_remote_suggested_reply().is_some() {
-        let prepared = input::take_prepared_input(app);
-        if let Err(error) = submit_prepared_remote_input(app, remote, prepared).await {
+        if let Err(error) = key_handling::submit_remote_enter_input(app, remote).await {
             app.push_display_message(DisplayMessage::error(format!(
                 "Failed to submit suggested reply: {error}"
             )));

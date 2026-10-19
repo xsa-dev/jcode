@@ -4,15 +4,15 @@
 //! the configured trusted account gateway, and checks its live purpose-specific
 //! capability before each evaluation. Credential presence is not entitlement.
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use reqwest::{Client, Response, Url};
 use serde_json::{Map, Value, json};
 use std::time::Duration;
 
 mod laya;
 use laya::{
-    configured_laya_base, has_configured_laya, laya_endpoint, resolve_laya_with,
-    resolve_suggestions_with, should_bypass_proxy,
+    configured_laya_base, laya_endpoint, resolve_laya_with, resolve_suggestions_with,
+    should_bypass_proxy, validate_choice_answer,
 };
 
 const PROVIDER_ENV: &str = "JCODE_MEMORY_JEV_PROVIDER";
@@ -21,6 +21,7 @@ const VOICE_PROVIDER_ENV: &str = "JCODE_VOICE_JEV_PROVIDER";
 const SUGGESTIONS_PROVIDER_ENV: &str = "JCODE_SUGGESTIONS_JEV_PROVIDER";
 const LAYA_BASE_URL_ENV: &str = "JCODE_LAYA_BASE_URL";
 const LAYA_DEFAULT_BASE: &str = "http://127.0.0.1:8080";
+pub const DEFAULT_MEMORY_JEV_MODEL: &str = "typesafe/jev-1.13";
 const MAX_REQUEST_BYTES: usize = 80 * 1024;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_ME_BYTES: usize = 16 * 1024;
@@ -156,7 +157,7 @@ impl JevProvider {
 
     fn model(self) -> &'static str {
         match self {
-            Self::OpenRouter | Self::Jcode => "typesafe/jev-1.13",
+            Self::OpenRouter | Self::Jcode => DEFAULT_MEMORY_JEV_MODEL,
             Self::TypeSafe => "jev-latest",
             Self::OpenJev => "openjev",
             Self::Laya => "laya-latest",
@@ -176,6 +177,44 @@ impl JevProvider {
     }
 }
 
+fn configured_model_override(purpose: JevPurpose) -> Option<String> {
+    let (env, configured) = match purpose {
+        JevPurpose::Memory => (
+            "JCODE_MEMORY_JEV_MODEL",
+            crate::config::config().agents.memory_jev_model.clone(),
+        ),
+        JevPurpose::Browser => (
+            "JCODE_BROWSER_JEV_MODEL",
+            crate::config::config().agents.browser_jev_model.clone(),
+        ),
+        JevPurpose::Voice => (
+            "JCODE_VOICE_JEV_MODEL",
+            crate::config::config().agents.voice_jev_model.clone(),
+        ),
+        JevPurpose::Suggestions => return None,
+    };
+    resolve_model_override(std::env::var(env).ok(), configured)
+}
+
+fn resolve_model_override(
+    environment: Option<String>,
+    configured: Option<String>,
+) -> Option<String> {
+    environment
+        .or(configured)
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+}
+
+fn resolve_jev_model(purpose: JevPurpose, provider: JevProvider) -> String {
+    configured_model_override(purpose).unwrap_or_else(|| provider.model().to_string())
+}
+
+/// The browser fallback label is shown when no decision request can be created.
+pub fn browser_jev_model_label() -> String {
+    resolve_jev_model(JevPurpose::Browser, JevProvider::OpenRouter)
+}
+
 /// Do not derive Debug: this contains a provider secret.
 #[derive(Clone)]
 pub struct JevClient {
@@ -185,6 +224,7 @@ pub struct JevClient {
     hedge_clients: Vec<Client>,
     purpose: JevPurpose,
     provider: JevProvider,
+    model_id: String,
     api_key: String,
     endpoint: String,
     me_endpoint: Option<String>,
@@ -219,45 +259,6 @@ impl JevClient {
         Self::for_purpose(JevPurpose::Voice)
     }
 
-    /// Suggestions routing prefers explicit OpenJev SystemOne (`OPENJEV_API_KEY`),
-    /// then Jcode / TypeSafe / OpenRouter / AIMLAPI when `auto` is selected.
-    /// Evaluation never changes accounts after an auth/billing failure.
-    pub fn for_suggestions() -> Result<Self> {
-        Self::for_purpose(JevPurpose::Suggestions)
-    }
-
-    pub fn for_suggestions_with_selector(config_selector: &str) -> Result<Self> {
-        let (provider, api_key, endpoint, me_endpoint) =
-            Self::resolve_with_suggestions_default(config_selector)?;
-        let bypass_proxy = should_bypass_proxy(provider, &endpoint);
-        let client = client_builder_for(bypass_proxy)
-            .build()
-            .map_err(|_| anyhow!("Could not initialize the Jev decision client"))?;
-        Ok(Self {
-            client,
-            hedge_clients: Vec::new(),
-            purpose: JevPurpose::Suggestions,
-            provider,
-            api_key,
-            endpoint,
-            me_endpoint,
-        })
-    }
-
-    /// True when the active route supports direct SystemOne `choice` questions
-    /// (`OpenJev`, `TypeSafe`, `OpenRouter`, `Aimlapi`). `Jcode` subscription
-    /// decisions only accept `noul` outside of Browser mode.
-    pub fn supports_choice_questions(&self) -> bool {
-        self.provider != JevProvider::Jcode || self.purpose == JevPurpose::Browser
-    }
-
-    /// True when `JCODE_LAYA_BASE_URL`, `LAYA_BASE_URL`, or `LAYA_API_KEY` is configured in env or `laya.env`.
-    pub fn has_configured_laya_route() -> bool {
-        has_configured_laya(&mut |env, file| {
-            crate::provider_catalog::load_env_value_from_env_or_config(env, file)
-        })
-    }
-
     fn for_purpose(purpose: JevPurpose) -> Result<Self> {
         let (provider, api_key, endpoint, me_endpoint) = Self::resolve(purpose)?;
         let bypass_proxy = should_bypass_proxy(provider, &endpoint);
@@ -280,6 +281,7 @@ impl JevClient {
             hedge_clients,
             purpose,
             provider,
+            model_id: resolve_jev_model(purpose, provider),
             api_key,
             endpoint,
             me_endpoint,
@@ -340,7 +342,7 @@ impl JevClient {
     }
 
     pub fn model_id(&self) -> &str {
-        self.provider.model()
+        &self.model_id
     }
 
     /// Largest question batch this route accepts in one request.
@@ -352,7 +354,13 @@ impl JevClient {
     /// Never retries using another provider or account after an auth/billing
     /// failure. Callers own the relevance threshold and uncertainty policy.
     pub async fn evaluate(&self, state: Value, questions: Map<String, Value>) -> Result<Value> {
-        let body = request_body_for(self.purpose, self.provider, state, &questions)?;
+        let body = request_body_with_model(
+            self.purpose,
+            self.provider,
+            &self.model_id,
+            state,
+            &questions,
+        )?;
         if let Some(endpoint) = &self.me_endpoint {
             let response = self
                 .client
@@ -382,7 +390,12 @@ impl JevClient {
             return self.send_hedged(body, &questions).await;
         }
         let value = self.send(&self.endpoint, body).await?;
-        validate_answers(&value, &questions)?;
+        validate_answers(&value, &questions).with_context(|| {
+            format!(
+                "Jev model '{}' returned an incompatible Decisions response",
+                self.model_id
+            )
+        })?;
         Ok(value)
     }
 
@@ -402,7 +415,12 @@ impl JevClient {
                 }
                 let result = async {
                     let value = self.send_with(&client, &self.endpoint, body).await?;
-                    validate_answers(&value, questions)?;
+                    validate_answers(&value, questions).with_context(|| {
+                        format!(
+                            "Jev model '{}' returned an incompatible Decisions response",
+                            self.model_id
+                        )
+                    })?;
                     Ok::<_, anyhow::Error>(value)
                 }
                 .await;
@@ -457,6 +475,12 @@ impl JevClient {
                 ));
                 tokio::time::sleep(delay).await;
                 continue;
+            }
+            if status == 400 || status == 404 {
+                bail!(
+                    "Jev request for model '{}' returned HTTP {status}; verify the model supports the selected Decisions endpoint",
+                    self.model_id
+                );
             }
             return read_response(response, MAX_RESPONSE_BYTES, self.provider).await;
         }
@@ -651,9 +675,20 @@ fn request_body(
     request_body_for(JevPurpose::Memory, provider, state, questions)
 }
 
+#[cfg(test)]
 fn request_body_for(
     purpose: JevPurpose,
     provider: JevProvider,
+    state: Value,
+    questions: &Map<String, Value>,
+) -> Result<Vec<u8>> {
+    request_body_with_model(purpose, provider, provider.model(), state, questions)
+}
+
+fn request_body_with_model(
+    purpose: JevPurpose,
+    provider: JevProvider,
+    model: &str,
     state: Value,
     questions: &Map<String, Value>,
 ) -> Result<Vec<u8>> {
@@ -728,7 +763,7 @@ fn request_body_for(
             state
         };
     let body = serde_json::to_vec(&json!({
-        "model": provider.model(), "state": state, "questions": questions
+        "model": model, "state": state, "questions": questions
     }))
     .map_err(|_| anyhow!("Could not encode Jev request"))?;
     ensure!(
@@ -844,35 +879,7 @@ fn validate_answers(value: &Value, questions: &Map<String, Value>) -> Result<()>
                 "Jev returned an invalid noul probability"
             );
         } else if question["type"] == "choice" {
-            let criteria = question["criteria"]
-                .as_object()
-                .ok_or_else(|| anyhow!("Jev choice question is missing criteria"))?;
-            let choice = answer["choice"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Jev choice answer omitted selected choice"))?;
-            ensure!(
-                criteria.contains_key(choice),
-                "Jev choice answer selected an unknown option"
-            );
-            if let Some(conf) = answer.get("confidence").and_then(Value::as_f64) {
-                ensure!(
-                    conf.is_finite() && (0.0..=1.0).contains(&conf),
-                    "Jev returned an invalid choice confidence"
-                );
-            }
-            if let Some(probs) = answer.get("probabilities").and_then(Value::as_object) {
-                for (opt, prob) in probs {
-                    ensure!(
-                        criteria.contains_key(opt),
-                        "Jev returned probability for an unknown choice option"
-                    );
-                    ensure!(
-                        prob.as_f64()
-                            .is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v)),
-                        "Jev returned an invalid choice probability"
-                    );
-                }
-            }
+            validate_choice_answer(question, answer)?;
         }
     }
     Ok(())
@@ -948,6 +955,13 @@ mod tests {
         assert_eq!(
             provider.endpoint("").unwrap(),
             "https://api.typesafe.ai/v1/systemone"
+        );
+        let (provider, _) = resolve_voice_with("laya", |_, _| None).unwrap();
+        assert_eq!(provider, JevProvider::Laya);
+        assert_eq!(provider.model(), "laya-latest");
+        assert_eq!(
+            provider.endpoint("").unwrap(),
+            "http://127.0.0.1:8080/v1/systemone"
         );
         for selector in ["auto", "typesafe", "jcode"] {
             let error = resolve_voice_with(selector, |env, _| {
@@ -1193,9 +1207,9 @@ mod tests {
         );
         assert_eq!(
             JevProvider::Laya
-                .endpoint("http://127.0.0.1:8080/v1/decisions")
+                .endpoint("http://node.tailnet.ts.net:8000/v1/decisions")
                 .unwrap(),
-            "http://127.0.0.1:8080/v1/systemone"
+            "http://node.tailnet.ts.net:8000/v1/systemone"
         );
         for invalid in [
             "http://public.example.com:8080",
@@ -1475,10 +1489,75 @@ mod tests {
                 .collect(),
             purpose: JevPurpose::Memory,
             provider,
+            model_id: provider.model().to_string(),
             api_key: "test-route-secret".into(),
             endpoint: format!("{base}/v1/decisions"),
             me_endpoint: (provider == JevProvider::Jcode).then(|| format!("{base}/v1/me")),
         }
+    }
+
+    #[test]
+    fn model_override_precedence_and_provider_defaults() {
+        assert_eq!(
+            resolve_model_override(Some(" custom/model ".into()), Some("config/model".into())),
+            Some("custom/model".into())
+        );
+        assert_eq!(
+            resolve_model_override(None, Some(" config/model ".into())),
+            Some("config/model".into())
+        );
+        assert_eq!(resolve_model_override(None, None), None);
+        assert_eq!(
+            resolve_model_override(Some(" ".into()), Some("config/model".into())),
+            None
+        );
+        assert_eq!(JevProvider::OpenRouter.model(), "typesafe/jev-1.13");
+        assert_eq!(JevProvider::Jcode.model(), "typesafe/jev-1.13");
+        assert_eq!(JevProvider::TypeSafe.model(), "jev-latest");
+        assert_eq!(JevProvider::Aimlapi.model(), "typesafe/jev");
+    }
+
+    #[test]
+    fn request_body_uses_explicit_model_override() {
+        let body = request_body_with_model(
+            JevPurpose::Memory,
+            JevProvider::OpenRouter,
+            "typesafe/jev-1.14",
+            json!("query"),
+            &questions(),
+        )
+        .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], "typesafe/jev-1.14");
+    }
+
+    #[tokio::test]
+    async fn client_reports_and_sends_the_same_configured_model() {
+        let (base, worker) = mock_server(vec![(200, response().to_string(), vec![])]);
+        let mut client = mock_client(&base, JevProvider::OpenRouter);
+        client.model_id = "typesafe/jev-1.14".into();
+        assert_eq!(client.model_id(), "typesafe/jev-1.14");
+        client.evaluate(json!("query"), questions()).await.unwrap();
+        let requests = worker.join().unwrap();
+        let body: Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["model"], client.model_id());
+    }
+
+    #[tokio::test]
+    async fn rejected_model_returns_bounded_error_without_fallback() {
+        let (base, worker) = mock_server(vec![(400, "unsupported model".into(), vec![])]);
+        let mut client = mock_client(&base, JevProvider::OpenRouter);
+        client.model_id = "typesafe/jev-1.14".into();
+        let error = client
+            .evaluate(json!("query"), questions())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("typesafe/jev-1.14"));
+        assert!(error.contains("HTTP 400"));
+        assert!(error.contains("Decisions endpoint"));
+        assert_eq!(worker.join().unwrap().len(), 1);
     }
 
     #[tokio::test]
