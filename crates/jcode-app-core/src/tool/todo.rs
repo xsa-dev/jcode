@@ -757,7 +757,11 @@ impl Tool for TodoTool {
                         "properties": {
                             "content": {
                                 "type": "string",
-                                "description": "Task."
+                                "description": "Short title, ideally under 40 characters; todos render side by side. Put longer context in details."
+                            },
+                            "details": {
+                                "type": "string",
+                                "description": "Optional longer brief: files, acceptance criteria, context. Not shown on the card; given to a swarm worker that takes this todo."
                             },
                             "status": {
                                 "type": "string",
@@ -774,12 +778,12 @@ impl Tool for TodoTool {
                             },
                             "group": {
                                 "type": "string",
-                                "description": "Optional group label; one group per coherent goal, new direction = new group. Omit for flat list."
+                                "description": "Optional lane name: one lane per coherent goal; todos in a lane run in order and one swarm agent owns a lane. Omit for flat list."
                             },
-                            "wave": {
+                            "stage": {
                                 "type": "integer",
                                 "minimum": 1,
-                                "description": "Optional parallel wave (1, 2, 3...). Todos with the same wave are independent and can run at the same time; wave 2 starts after wave 1 is done. Omit when steps must happen in list order."
+                                "description": "Optional phase (1, 2, 3...). Phase 2 starts after phase 1 is done. Inside a phase, lanes (todos sharing a group) run in parallel. Omit when steps must happen in list order."
                             },
                             "confidence": {
                                 "type": "string",

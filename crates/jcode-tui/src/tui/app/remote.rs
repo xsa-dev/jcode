@@ -116,6 +116,7 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     }
     needs_redraw |= app.retire_expired_status_notice();
     needs_redraw |= app.poll_usage_reset();
+    needs_redraw |= app.poll_cloud_job();
     if let Some((provider, account)) = app.usage_reset.invalidate_account.take() {
         let sent = match provider {
             super::usage_reset::Provider::OpenAi => remote.invalidate_openai_usage(account).await,
@@ -581,10 +582,12 @@ async fn apply_terminal_event<B: Backend>(
                                             app.provider.context_window(),
                                         );
                                         let _ = remote.switch_anthropic_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to Anthropic account `{}`.",
-                                            label
-                                        )));
+                                        app.push_display_message(DisplayMessage::system(
+                                            crate::tui::app::helpers::account_switch_notice(
+                                                "Anthropic",
+                                                &label,
+                                            ),
+                                        ));
                                         app.set_status_notice(format!(
                                             "Account: switched to {}",
                                             label
@@ -603,10 +606,11 @@ async fn apply_terminal_event<B: Backend>(
                                             app.provider.context_window(),
                                         );
                                         let _ = remote.switch_openai_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to OpenAI account `{}`.",
-                                            label
-                                        )));
+                                        app.push_display_message(DisplayMessage::system(
+                                            crate::tui::app::helpers::account_switch_notice(
+                                                "OpenAI", &label,
+                                            ),
+                                        ));
                                         app.set_status_notice(format!(
                                             "OpenAI account: switched to {}",
                                             label

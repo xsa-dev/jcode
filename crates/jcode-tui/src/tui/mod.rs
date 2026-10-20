@@ -28,10 +28,13 @@ pub struct BackgroundTaskRow {
 }
 
 pub mod backend;
+mod cloud_git;
+mod cloud_status;
 pub(crate) mod color_support;
 mod core;
 pub(crate) mod fuzzy;
 pub mod herdr;
+mod info_widget_cloud;
 // Terminal image display + metadata helpers now live in the dependency-free
 // `jcode-terminal-image` crate (shared with the `read` tool). Re-exported here
 // so existing `crate::tui::image` paths keep working.
@@ -984,7 +987,7 @@ pub trait TuiState {
     fn client_update_available(&self) -> bool;
     /// Whether a newer server binary is available (remote mode)
     fn server_update_available(&self) -> Option<bool>;
-    /// Get info widget data (todos, client count, etc.)
+    /// Get info widget data (runtime, client count, etc.)
     fn info_widget_data(&self) -> info_widget::InfoWidgetData;
 
     /// Whether the inline swarm gallery band should be shown above the chat.
