@@ -665,6 +665,12 @@ mod tests {
                     "type": ["array", "null"],
                     "items": { "type": "string" },
                     "description": "background task ids"
+                },
+                "config": {
+                    "allOf": [
+                        { "type": ["object", "null"] },
+                        { "properties": { "name": { "type": ["string", "null"] } } }
+                    ]
                 }
             }
         });
@@ -677,6 +683,16 @@ mod tests {
             assert_eq!(out["properties"]["waiting_on"]["type"], "array");
             assert_eq!(out["properties"]["waiting_on"]["nullable"], true);
             assert_eq!(out["properties"]["waiting_on"]["items"]["type"], "string");
+            assert_eq!(out["properties"]["config"]["type"], "object");
+            assert_eq!(out["properties"]["config"]["nullable"], true);
+            assert_eq!(
+                out["properties"]["config"]["properties"]["name"]["type"],
+                "string"
+            );
+            assert_eq!(
+                out["properties"]["config"]["properties"]["name"]["nullable"],
+                true
+            );
             assert!(
                 must_not_contain_unsupported_constructs(&out, spec).is_empty(),
                 "normalized schema must pass conformance for `{}`: {out}",
