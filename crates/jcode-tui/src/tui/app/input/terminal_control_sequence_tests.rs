@@ -79,13 +79,29 @@ fn strips_late_osc_color_replies() {
     );
     assert_eq!(strip("11;rgba:ffff/ffff/ffff/ffff").as_deref(), Some(""));
 
+    // WezTerm can deliver the rest of a reply after an earlier prefix already
+    // looked complete and was scrubbed. These tails no longer contain `rgb:`.
+    assert_eq!(strip("d7/afaf/afaf\\").as_deref(), Some(""));
+    assert_eq!(strip("/8787\\").as_deref(), Some(""));
+    assert_eq!(
+        strip("draft d7/afaf/afaf\\/8787\\").as_deref(),
+        Some("draft ")
+    );
+
     // Half-arrived replies are left alone until the last component is
     // complete, so no tail is stranded.
     for partial in ["11;rgb:", "11;rgb:3030/34", "11;rgb:3030/3434/46"] {
         assert_eq!(strip(partial), None, "{partial:?}");
     }
     // Ordinary text survives.
-    for text in ["rgb:3030/3434/4646", "111;rgb:30/34/46", "use rgb(1,2,3)"] {
+    for text in [
+        "rgb:3030/3434/4646",
+        "111;rgb:30/34/46",
+        "use rgb(1,2,3)",
+        "d7/afaf/afaf",
+        "d7/beef/cafe\\",
+        "/path/8787\\file",
+    ] {
         assert_eq!(strip(text), None, "{text:?}");
     }
 

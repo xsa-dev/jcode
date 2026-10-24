@@ -797,7 +797,7 @@ fn bare_terminal_report_length(bytes: &[u8]) -> Option<usize> {
 /// insertion contains the whole sequence, so it has to be recognized in the
 /// accumulated buffer instead.
 fn scrub_osc_color_replies(app: &mut App) {
-    if !app.input.contains("rgb") {
+    if !app.input.contains("rgb") && !app.input.contains('\\') {
         return;
     }
     let Some((cleaned, cursor)) = strip_osc_color_replies(&app.input, app.cursor_pos) else {
@@ -814,7 +814,10 @@ fn scrub_osc_color_replies(app: &mut App) {
 /// three (or four for `rgba`) `/`-separated hex components that all share the
 /// first component's width. Requiring equal widths keeps a half-arrived reply
 /// from matching early and leaving its tail behind. An adjacent `]` or `\` (surviving pieces of the OSC
-/// introducer and string terminator) is removed with it.
+/// introducer and string terminator) is removed with it. WezTerm can also split
+/// a reply after an early, temporarily complete-looking prefix was already
+/// removed. Narrow trailing fragments such as `d7/afaf/afaf\` and `/8787\`
+/// are recognized by their duplicated-byte color components and ST remnant.
 pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(String, usize)> {
     let bytes = input.as_bytes();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -874,9 +877,60 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         ranges.push((start, pos));
         search = pos;
     }
+
+    // A fragmented key stream can make a prefix look complete before all of a
+    // 16-bit color component has arrived. Once that prefix is scrubbed, later
+    // keys contain no `rgb:` marker to anchor on. Only accept the specific
+    // duplicated-byte form terminals use for 8-bit colors expanded to 16 bits,
+    // plus the surviving OSC string terminator, to avoid eating path-like or
+    // slash-separated text merely because it contains hex digits.
+    let repeated_byte = |component: &[u8]| {
+        component.len() == 4
+            && component.iter().all(u8::is_ascii_hexdigit)
+            && component[..2] == component[2..]
+    };
+    let tail_len = |tail: &[u8]| -> Option<usize> {
+        if tail.len() >= 6 && tail[0] == b'/' && repeated_byte(&tail[1..5]) && tail[5] == b'\\' {
+            return Some(6);
+        }
+        for first_width in [4, 2] {
+            let end = first_width + 11;
+            if tail.len() < end
+                || !tail[..first_width].iter().all(u8::is_ascii_hexdigit)
+                || (first_width == 4 && !repeated_byte(&tail[..4]))
+                || tail[first_width] != b'/'
+                || !repeated_byte(&tail[first_width + 1..first_width + 5])
+                || tail[first_width + 5] != b'/'
+                || !repeated_byte(&tail[first_width + 6..first_width + 10])
+                || tail[first_width + 10] != b'\\'
+            {
+                continue;
+            }
+            return Some(end);
+        }
+        None
+    };
+    for start in 0..bytes.len() {
+        let Some(len) = tail_len(&bytes[start..]) else {
+            continue;
+        };
+        let end = start + len;
+        if end != bytes.len() && bytes.get(end) != Some(&b'/') {
+            continue;
+        }
+        if ranges
+            .iter()
+            .any(|&(range_start, range_end)| start < range_end && end > range_start)
+        {
+            continue;
+        }
+        ranges.push((start, end));
+    }
     if ranges.is_empty() {
         return None;
     }
+
+    ranges.sort_unstable_by_key(|&(start, _)| start);
 
     let mut cleaned = String::with_capacity(input.len());
     let mut new_cursor = cursor;
