@@ -86,8 +86,14 @@ fn strips_late_osc_color_replies() {
     assert_eq!(strip("00\\").as_deref(), Some(""));
     assert_eq!(strip("87\\").as_deref(), Some(""));
     assert_eq!(strip("00\\87\\").as_deref(), Some(""));
+    assert_eq!(strip("gb:d7/afaf/afaf\\").as_deref(), Some(""));
+    assert_eq!(strip("gb:d7d7/afaf/afaf\\").as_deref(), Some(""));
+    assert_eq!(strip("rgb:d7d7/afaf/afaf\\").as_deref(), Some(""));
+    assert_eq!(strip(";rgb:d7d7/afaf/afaf\\").as_deref(), Some(""));
+    assert_eq!(strip("1;rgb:d7d7/afaf/afaf\\").as_deref(), Some(""));
+    assert_eq!(strip("gb:00\\87\\").as_deref(), Some(""));
     assert_eq!(
-        strip("draft d7/afaf/afaf\\/8787\\00\\87\\").as_deref(),
+        strip("draft gb:d7/afaf/afaf\\/8787\\00\\87\\").as_deref(),
         Some("draft ")
     );
 

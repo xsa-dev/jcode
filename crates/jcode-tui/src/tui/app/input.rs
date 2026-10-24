@@ -797,7 +797,7 @@ fn bare_terminal_report_length(bytes: &[u8]) -> Option<usize> {
 /// insertion contains the whole sequence, so it has to be recognized in the
 /// accumulated buffer instead.
 fn scrub_osc_color_replies(app: &mut App) {
-    if !app.input.contains("rgb") && !app.input.contains('\\') {
+    if !app.input.contains("rgb") && !app.input.contains("gb:") && !app.input.contains('\\') {
         return;
     }
     let Some((cleaned, cursor)) = strip_osc_color_replies(&app.input, app.cursor_pos) else {
@@ -810,33 +810,25 @@ fn scrub_osc_color_replies(app: &mut App) {
 /// Strip complete OSC color reply bodies from `input`, returning the cleaned
 /// text and the cursor remapped onto it, or `None` when nothing matched.
 ///
-/// A body only matches once it is complete: `1N;rgb:` (or `rgba:`) followed by
-/// three (or four for `rgba`) `/`-separated hex components that all share the
-/// first component's width. Requiring equal widths keeps a half-arrived reply
-/// from matching early and leaving its tail behind. An adjacent `]` or `\` (surviving pieces of the OSC
-/// introducer and string terminator) is removed with it. WezTerm can also split
-/// a reply after an early, temporarily complete-looking prefix was already
-/// removed. Narrow trailing fragments such as `d7/afaf/afaf\` and `/8787\`
-/// are recognized by their duplicated-byte color components and ST remnant.
+/// A body only matches once it is complete: `1N;rgb:` (or `rgba:`, or a torn
+/// suffix such as `;rgb:`, `rgb:`, or `gb:` when earlier bytes were eaten by a
+/// terminal query timeout or Alt-chord handler) followed by three (or four for
+/// `rgba`) `/`-separated hex components that all share the first component's
+/// width. Requiring equal widths keeps a half-arrived reply from matching early
+/// and leaving its tail behind. An adjacent `]` or `\` (surviving pieces of the
+/// OSC introducer and string terminator) is removed with it. WezTerm can also
+/// split a reply after an early, temporarily complete-looking prefix was already
+/// removed. Narrow trailing fragments such as `d7/afaf/afaf\`, `/8787\`, `00\`,
+/// and `gb:` are recognized by their duplicated-byte color components or torn
+/// OSC header/terminator remnants.
 pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(String, usize)> {
     let bytes = input.as_bytes();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut search = 0usize;
-    while let Some(found) = input[search..].find(";rgb") {
-        let semi = search + found;
-        search = semi + 1;
-        // `1` then one digit before the `;`: OSC 10..=19 color reports.
-        if semi < 2 || bytes[semi - 2] != b'1' || !bytes[semi - 1].is_ascii_digit() {
-            continue;
-        }
-        let mut start = semi - 2;
-        // A third leading digit means this is some other number, not `1N`,
-        // unless it is the tail of a reply we just matched.
-        let follows_reply = ranges.last().is_some_and(|&(_, end)| end == start);
-        if start > 0 && bytes[start - 1].is_ascii_digit() && !follows_reply {
-            continue;
-        }
-        let mut pos = semi + 4;
+    while let Some(found) = input[search..].find("gb") {
+        let gb_pos = search + found;
+        search = gb_pos + 1;
+        let mut pos = gb_pos + 2;
         let mut wanted = 3;
         if bytes.get(pos) == Some(&b'a') {
             pos += 1;
@@ -846,6 +838,44 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
             continue;
         }
         pos += 1;
+
+        // Recognize full `1N;rgb:` headers as well as torn headers (`N;rgb:`,
+        // `;rgb:`, `rgb:`, `gb:`) where an earlier read or Alt+r handler ate
+        // the leading bytes of the OSC 10..=19 reply.
+        let mut has_osc_num = false;
+        let mut start = gb_pos;
+        if start > 0 && bytes[start - 1] == b'r' {
+            start -= 1;
+            if start > 0 && bytes[start - 1] == b';' {
+                if start >= 3 && bytes[start - 3] == b'1' && bytes[start - 2].is_ascii_digit() {
+                    let candidate_start = start - 3;
+                    let follows_reply =
+                        ranges.last().is_some_and(|&(_, end)| end == candidate_start);
+                    if candidate_start > 0
+                        && bytes[candidate_start - 1].is_ascii_digit()
+                        && !follows_reply
+                    {
+                        continue;
+                    }
+                    start = candidate_start;
+                    has_osc_num = true;
+                } else if start >= 2
+                    && bytes[start - 2].is_ascii_digit()
+                    && (start == 2 || !bytes[start - 3].is_ascii_digit())
+                {
+                    start -= 2;
+                } else if start == 1 || !bytes[start - 2].is_ascii_alphanumeric() {
+                    start -= 1;
+                } else {
+                    continue;
+                }
+            } else if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+        } else if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+
         let hex_run = |from: usize| {
             bytes[from..]
                 .iter()
@@ -856,16 +886,19 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         if !(1..=4).contains(&width) {
             continue;
         }
+        // Without a leading `1N;` prefix, require either an explicit `\`
+        // terminator or 16-bit duplicated-byte hex components so ordinary text
+        // like `rgb:3030/3434/4646` (with no `\`) is preserved.
         pos += width;
-        // Later components take `width` digits when the first component is
-        // already 4 hex digits (so a second reply glued onto the last one,
-        // `f4f411;rgb:...`, still splits cleanly).
         let mut components = 1;
         while components < wanted && bytes.get(pos) == Some(&b'/') && hex_run(pos + 1) >= width {
             pos += 1 + width;
             components += 1;
         }
         if components < wanted {
+            continue;
+        }
+        if !has_osc_num && bytes.get(pos) != Some(&b'\\') {
             continue;
         }
         if start > 0 && bytes[start - 1] == b']' {
@@ -937,13 +970,34 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         {
             continue;
         }
+        let mut actual_start = start;
+        while actual_start >= 3 && &bytes[actual_start - 3..actual_start] == b"gb:" {
+            actual_start -= 3;
+            if actual_start > 0 && bytes[actual_start - 1] == b'r' {
+                actual_start -= 1;
+                if actual_start > 0 && bytes[actual_start - 1] == b';' {
+                    actual_start -= 1;
+                    if actual_start >= 2
+                        && bytes[actual_start - 2] == b'1'
+                        && bytes[actual_start - 1].is_ascii_digit()
+                    {
+                        actual_start -= 2;
+                    } else if actual_start >= 1 && bytes[actual_start - 1].is_ascii_digit() {
+                        actual_start -= 1;
+                    }
+                }
+            }
+            if actual_start > 0 && bytes[actual_start - 1] == b']' {
+                actual_start -= 1;
+            }
+        }
         if ranges
             .iter()
-            .any(|&(range_start, range_end)| start < range_end && end > range_start)
+            .any(|&(range_start, range_end)| actual_start < range_end && end > range_start)
         {
             continue;
         }
-        ranges.push((start, end));
+        ranges.push((actual_start, end));
     }
     if ranges.is_empty() {
         return None;
