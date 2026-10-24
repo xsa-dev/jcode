@@ -1,7 +1,7 @@
 {
-  "total": 3996,
+  "total": 3994,
   "totals_by_pattern": {
-    "dot_ok": 1569,
+    "dot_ok": 1567,
     "let_underscore": 1436,
     "unwrap_or_default": 991
   },
@@ -682,7 +682,7 @@
       "unwrap_or_default": 0
     },
     "crates/jcode-base/src/auth/antigravity.rs": {
-      "dot_ok": 8,
+      "dot_ok": 7,
       "let_underscore": 1,
       "unwrap_or_default": 0
     },
@@ -1517,7 +1517,7 @@
       "unwrap_or_default": 0
     },
     "crates/jcode-provider-antigravity-runtime/src/lib.rs": {
-      "dot_ok": 3,
+      "dot_ok": 2,
       "let_underscore": 21,
       "unwrap_or_default": 3
     },

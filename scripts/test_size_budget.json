@@ -13,7 +13,7 @@
     "crates/jcode-base/src/compaction_tests.rs": 1331,
     "crates/jcode-base/src/config_tests.rs": 1807,
     "crates/jcode-base/src/live_tests.rs": 3087,
-    "crates/jcode-base/src/provider/tests.rs": 1335,
+    "crates/jcode-base/src/provider/tests.rs": 1308,
     "crates/jcode-base/src/provider/tests/model_resolution.rs": 2248,
     "crates/jcode-base/src/provider_catalog_tests.rs": 1409,
     "crates/jcode-base/src/session_tests/cases.rs": 3267,

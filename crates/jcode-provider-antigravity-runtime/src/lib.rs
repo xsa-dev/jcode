@@ -906,8 +906,10 @@ impl Provider for AntigravityProvider {
                 .iter()
                 .find(|entry| entry.id == id)
                 .and_then(|entry| entry.max_tokens)
-                .and_then(|limit| usize::try_from(limit).ok())
-                .filter(|limit| *limit > 0)
+                .and_then(|limit| match usize::try_from(limit) {
+                    Ok(limit) if limit > 0 => Some(limit),
+                    _ => None,
+                })
         };
         limit_for(&resolved)
             .or_else(|| limit_for(&selected))
