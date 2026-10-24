@@ -1201,6 +1201,12 @@ impl MessageChannel for AgichanChannel {
                                     let Ok(chunk) = chunk_res else {
                                         break;
                                     };
+                                    if buf.len() + chunk.len() > 1024 * 1024 {
+                                        logging::warn(
+                                            "agichan SSE line buffer exceeded 1 MiB without newline; reconnecting",
+                                        );
+                                        break;
+                                    }
                                     buf.push_str(&String::from_utf8_lossy(&chunk));
                                     for (ev, ev_since) in Self::drain_sse_events(&mut buf) {
                                         match self.inspect_event_and_build_interrupt(&ev).await {

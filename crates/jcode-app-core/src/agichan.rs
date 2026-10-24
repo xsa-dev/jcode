@@ -318,6 +318,17 @@ impl KeypairFileLock {
         }
         Ok(Self { _file: file })
     }
+
+    /// Acquire the advisory file lock on a blocking thread with a bounded timeout so
+    /// Tokio worker threads are never blocked if another process holds `<keypair>.json.lock`.
+    pub async fn acquire_async(keypair_path: PathBuf, timeout_duration: Duration) -> Option<Self> {
+        let fut = tokio::task::spawn_blocking(move || Self::acquire(&keypair_path).ok());
+        tokio::time::timeout(timeout_duration, fut)
+            .await
+            .ok()
+            .and_then(|res| res.ok())
+            .flatten()
+    }
 }
 
 #[cfg(unix)]
@@ -407,18 +418,23 @@ pub async fn poll_turn_digest_for_session(
         .arg("--room")
         .arg(&room_id)
         .arg("digest");
-    if let Some(h) = handle.map(str::trim).filter(|h| !h.is_empty()) {
+    if let Some(h) = handle
+        .map(|s| s.trim().trim_start_matches('@'))
+        .filter(|h| is_valid_handle(h, false))
+    {
         cmd.arg("--as").arg(h);
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
 
     // Acquire advisory lock on sponsor.json while running the digest CLI so concurrent
     // sessions or worker startups do not race on state.json.
-    let _lock = sponsor_path
-        .as_deref()
-        .and_then(|p| KeypairFileLock::acquire(p).ok());
+    let _lock = match sponsor_path {
+        Some(p) => KeypairFileLock::acquire_async(p, Duration::from_secs(2)).await,
+        None => None,
+    };
 
     let output = match tokio::time::timeout(INTERACTIVE_DIGEST_TIMEOUT, cmd.output()).await {
         Ok(Ok(out)) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -938,16 +954,18 @@ pub async fn run_agichan_command(
     })?;
 
     let sponsor_path = data_dir.as_ref().map(|d| d.join("sponsor.json"));
-    let _lock = sponsor_path
-        .as_deref()
-        .and_then(|p| KeypairFileLock::acquire(p).ok());
+    let _lock = match sponsor_path {
+        Some(p) => KeypairFileLock::acquire_async(p, Duration::from_secs(5)).await,
+        None => None,
+    };
 
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.current_dir(&cwd)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
 
     let out = tokio::time::timeout(timeout_duration, cmd.output())
         .await
@@ -1007,6 +1025,9 @@ pub async fn fetch_room_board_json(
         .map(|s| s.trim().trim_start_matches('@'))
         .filter(|s| !s.is_empty())
     {
+        if !is_valid_handle(h, false) {
+            anyhow::bail!("invalid agichan handle: {h}");
+        }
         let keys_dir = std::env::var("AGICHAN_KEYS")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -1022,7 +1043,7 @@ pub async fn fetch_room_board_json(
 
     let bin = resolve_agichan_binary(Some(&data_dir))
         .ok_or_else(|| anyhow::anyhow!("agichan binary not found"))?;
-    let _lock = KeypairFileLock::acquire(&keypair_path).ok();
+    let _lock = KeypairFileLock::acquire_async(keypair_path.clone(), Duration::from_secs(5)).await;
 
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.current_dir(&cwd)
@@ -1035,7 +1056,8 @@ pub async fn fetch_room_board_json(
         .arg("300")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
 
     let out = tokio::time::timeout(Duration::from_secs(15), cmd.output())
         .await
@@ -1060,6 +1082,8 @@ pub fn clear_session_digest_state_for_tests(session_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn room_key_matches_first_16_hex_of_sha256() {
@@ -1265,6 +1289,8 @@ t4  [claimed]  @dave  port  (by alice, last dave)";
     async fn federated_swarm_actions_join_code_join_roster_share_and_assign_roundtrip() {
         use crate::tool::Tool;
         use std::os::unix::fs::PermissionsExt;
+
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = tempfile::tempdir().expect("tempdir");
         let bin_path = dir.path().join("mock-agichan");

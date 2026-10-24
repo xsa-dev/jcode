@@ -2157,6 +2157,12 @@ impl Tool for CommunicateTool {
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                 {
+                    if !ttl.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                        return Err(anyhow::anyhow!(
+                            "Invalid ttl '{}' for join_code (expected e.g. '24h', '30m')",
+                            ttl
+                        ));
+                    }
                     args.push("--ttl".to_string());
                     args.push((*ttl).to_string());
                 }
@@ -2765,6 +2771,12 @@ impl Tool for CommunicateTool {
                         .map(|m| m.trim().trim_start_matches('@'))
                         .filter(|m| !m.is_empty())
                         .unwrap_or("lead");
+                    if !crate::agichan::is_valid_handle(lead, false) {
+                        return Err(anyhow::anyhow!(
+                            "Invalid manager handle '{}' for federated stop",
+                            lead
+                        ));
+                    }
                     let args = vec![
                         "manager".to_string(),
                         "--as".to_string(),
