@@ -83,8 +83,11 @@ fn strips_late_osc_color_replies() {
     // looked complete and was scrubbed. These tails no longer contain `rgb:`.
     assert_eq!(strip("d7/afaf/afaf\\").as_deref(), Some(""));
     assert_eq!(strip("/8787\\").as_deref(), Some(""));
+    assert_eq!(strip("00\\").as_deref(), Some(""));
+    assert_eq!(strip("87\\").as_deref(), Some(""));
+    assert_eq!(strip("00\\87\\").as_deref(), Some(""));
     assert_eq!(
-        strip("draft d7/afaf/afaf\\/8787\\").as_deref(),
+        strip("draft d7/afaf/afaf\\/8787\\00\\87\\").as_deref(),
         Some("draft ")
     );
 

@@ -857,9 +857,9 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
             continue;
         }
         pos += width;
-        // Later components take exactly `width` digits, so a second reply
-        // glued onto the last one (`f4f411;rgb:...`) still splits cleanly,
-        // while a component that is still arriving is too short to match.
+        // Later components take `width` digits when the first component is
+        // already 4 hex digits (so a second reply glued onto the last one,
+        // `f4f411;rgb:...`, still splits cleanly).
         let mut components = 1;
         while components < wanted && bytes.get(pos) == Some(&b'/') && hex_run(pos + 1) >= width {
             pos += 1 + width;
@@ -881,15 +881,23 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
     // A fragmented key stream can make a prefix look complete before all of a
     // 16-bit color component has arrived. Once that prefix is scrubbed, later
     // keys contain no `rgb:` marker to anchor on. Only accept the specific
-    // duplicated-byte form terminals use for 8-bit colors expanded to 16 bits,
-    // plus the surviving OSC string terminator, to avoid eating path-like or
-    // slash-separated text merely because it contains hex digits.
+    // duplicated-byte (or 2-hex-digit tail) form terminals use for 8-bit
+    // colors expanded to 16 bits, plus the surviving OSC string terminator,
+    // to avoid eating path-like or slash-separated text merely because it
+    // contains hex digits.
     let repeated_byte = |component: &[u8]| {
         component.len() == 4
             && component.iter().all(u8::is_ascii_hexdigit)
             && component[..2] == component[2..]
     };
     let tail_len = |tail: &[u8]| -> Option<usize> {
+        if tail.len() >= 3
+            && tail[0].is_ascii_hexdigit()
+            && tail[1].is_ascii_hexdigit()
+            && tail[2] == b'\\'
+        {
+            return Some(3);
+        }
         if tail.len() >= 6 && tail[0] == b'/' && repeated_byte(&tail[1..5]) && tail[5] == b'\\' {
             return Some(6);
         }
@@ -911,11 +919,22 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         None
     };
     for start in 0..bytes.len() {
-        let Some(len) = tail_len(&bytes[start..]) else {
+        let len = tail_len(&bytes[start..]);
+        let Some(len) = len else {
             continue;
         };
+        if len == 3
+            && start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'/')
+            && !ranges.iter().any(|&(_, range_end)| range_end == start)
+        {
+            continue;
+        }
         let end = start + len;
-        if end != bytes.len() && bytes.get(end) != Some(&b'/') {
+        if end != bytes.len()
+            && bytes.get(end) != Some(&b'/')
+            && tail_len(&bytes[end..]).is_none()
+        {
             continue;
         }
         if ranges
