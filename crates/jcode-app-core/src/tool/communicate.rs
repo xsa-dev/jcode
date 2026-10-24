@@ -1783,6 +1783,21 @@ struct CommunicateInput {
     /// active phase.
     #[serde(default, alias = "stage")]
     phase: Option<u32>,
+    /// For federated agichan `join`: one-time `agc1-...` join code.
+    #[serde(default)]
+    code: Option<String>,
+    /// For federated agichan `join_code`: TTL such as `"24h"`, `"30m"`, or seconds.
+    #[serde(default)]
+    ttl: Option<String>,
+    /// For federated agichan `share`: forward keys to ready workers reporting `missing=N`.
+    #[serde(default)]
+    missing: Option<bool>,
+    /// For federated agichan `share`: explicit worker handles (`@w-...`) to forward keys to.
+    #[serde(default)]
+    handles: Option<Vec<String>>,
+    /// For federated agichan actions: manager/coordinator handle (`--as <handle>`).
+    #[serde(default)]
+    manager: Option<String>,
 }
 
 impl CommunicateInput {
@@ -1826,7 +1841,11 @@ fn canonical_swarm_action(action: &str) -> &str {
         // so route it there (one way to talk to an agent).
         "dm" | "dm_session" | "direct_message" | "whisper" => "message",
         "broadcast_all" | "announce" => "broadcast",
-        "agents" | "members" | "list_agents" | "list_members" | "roster" => "list",
+        "agents" | "members" | "list_agents" | "list_members" => "list",
+        "join-code" | "issue_join_code" => "join_code",
+        "agichan_roster" | "federated_roster" => "roster",
+        "agichan_join" => "join",
+        "agichan_share" | "share_keys" | "share_missing" => "share_keys",
         "swarms" | "list_swarm" | "swarm_list" => "list_swarms",
         "label_swarm" | "name_swarm" | "rename_swarm" | "set_label" => "set_swarm_label",
         "models" | "model_list" | "list_model" | "list_providers" | "list_routes" => "list_models",
@@ -2044,7 +2063,63 @@ impl Tool for CommunicateTool {
         params.action = canonical_swarm_action(&params.action).to_string();
 
         match params.action.as_str() {
-            "share" | "share_append" => {
+            "share" | "share_append" | "share_keys" => {
+                let wants_agichan_share = params.action == "share_keys"
+                    || params.missing.unwrap_or(false)
+                    || params.handles.as_ref().is_some_and(|h| !h.is_empty())
+                    || (params.key.is_none()
+                        && params.value.is_none()
+                        && params
+                            .target_session
+                            .as_deref()
+                            .is_some_and(|t| t.starts_with('@') || t == "--missing"));
+                if wants_agichan_share {
+                    let mut args = vec!["share".to_string()];
+                    if params.missing.unwrap_or(false)
+                        || params.target_session.as_deref() == Some("--missing")
+                    {
+                        args.push("--missing".to_string());
+                    }
+                    if let Some(ref hs) = params.handles {
+                        for h in hs {
+                            let clean = h.trim().trim_start_matches('@');
+                            if !crate::agichan::is_valid_handle(clean, false) {
+                                return Err(anyhow::anyhow!(
+                                    "Invalid agichan handle '{}' for share",
+                                    h
+                                ));
+                            }
+                            args.push(clean.to_string());
+                        }
+                    } else if let Some(ref t) = params.target_session
+                        && t != "--missing"
+                    {
+                        let clean = t.trim().trim_start_matches('@');
+                        if !crate::agichan::is_valid_handle(clean, false) {
+                            return Err(anyhow::anyhow!(
+                                "Invalid agichan handle '{}' for share",
+                                t
+                            ));
+                        }
+                        args.push(clean.to_string());
+                    }
+                    if args.len() == 1 {
+                        args.push("--missing".to_string());
+                    }
+                    let wd = params
+                        .working_dir
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| ctx.working_dir.clone());
+                    let out = crate::agichan::run_agichan_command(
+                        wd.as_deref(),
+                        &args,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await?;
+                    return Ok(ToolOutput::new(out));
+                }
+
                 let key = params
                     .key
                     .ok_or_else(|| anyhow::anyhow!("'key' is required for share action"))?;
@@ -2071,6 +2146,105 @@ impl Tool for CommunicateTool {
                         Ok(ToolOutput::new(format!("{}: {} = {}", verb, key, value)))
                     }
                     Err(e) => Err(anyhow::anyhow!("Failed to share: {}", e)),
+                }
+            }
+
+            "join_code" => {
+                let mut args = vec!["join-code".to_string()];
+                if let Some(ref ttl) = params
+                    .ttl
+                    .as_ref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    args.push("--ttl".to_string());
+                    args.push((*ttl).to_string());
+                }
+                let wd = params
+                    .working_dir
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| ctx.working_dir.clone());
+                let out = crate::agichan::run_agichan_command(
+                    wd.as_deref(),
+                    &args,
+                    std::time::Duration::from_secs(30),
+                )
+                .await?;
+                Ok(ToolOutput::new(out))
+            }
+
+            "join" => {
+                let code = params
+                    .code
+                    .as_deref()
+                    .or(params.value.as_deref())
+                    .or(params.message.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "'code' (an agc1-... one-time join code) is required for join action"
+                        )
+                    })?;
+                if !crate::agichan::is_valid_join_code(code) {
+                    return Err(anyhow::anyhow!(
+                        "'{}' is not a valid agc1-... join code",
+                        code
+                    ));
+                }
+                let wd = params
+                    .working_dir
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| ctx.working_dir.clone());
+                let mut args = vec!["join".to_string(), code.to_string()];
+                if let Some(ref dir) = wd {
+                    args.push("--dir".to_string());
+                    args.push(dir.display().to_string());
+                }
+                if params.force.unwrap_or(false) {
+                    args.push("--force".to_string());
+                }
+                let out = crate::agichan::run_agichan_command(
+                    wd.as_deref(),
+                    &args,
+                    std::time::Duration::from_secs(30),
+                )
+                .await?;
+                Ok(ToolOutput::new(out))
+            }
+
+            "roster" => {
+                let wd = params
+                    .working_dir
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| ctx.working_dir.clone());
+                if let Some(ref cwd) = wd
+                    && crate::agichan::resolve_project_room(cwd, None).is_some()
+                    && let Ok(out) = crate::agichan::run_agichan_command(
+                        Some(cwd),
+                        &["roster".to_string()],
+                        std::time::Duration::from_secs(20),
+                    )
+                    .await
+                {
+                    return Ok(ToolOutput::new(out));
+                }
+                let request = Request::CommList {
+                    id: REQUEST_ID,
+                    session_id: ctx.session_id.clone(),
+                };
+                match send_request(request).await {
+                    Ok(ServerEvent::CommMembers { members, .. }) => {
+                        Ok(format_members(&ctx, &members))
+                    }
+                    Ok(response) => {
+                        ensure_success(&response)?;
+                        Ok(ToolOutput::new("No agents found."))
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Failed to list agents: {}", e)),
                 }
             }
 
@@ -2577,6 +2751,36 @@ impl Tool for CommunicateTool {
                     anyhow::anyhow!("'target_session' is required for stop action")
                 })?;
 
+                if let Some(worker_handle) = target.strip_prefix('@')
+                    && crate::agichan::is_valid_handle(worker_handle, false)
+                {
+                    let wd = params
+                        .working_dir
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| ctx.working_dir.clone());
+                    let lead = params
+                        .manager
+                        .as_deref()
+                        .map(|m| m.trim().trim_start_matches('@'))
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or("lead");
+                    let args = vec![
+                        "manager".to_string(),
+                        "--as".to_string(),
+                        lead.to_string(),
+                        "stop".to_string(),
+                        format!("@{worker_handle}"),
+                    ];
+                    let out = crate::agichan::run_agichan_command(
+                        wd.as_deref(),
+                        &args,
+                        std::time::Duration::from_secs(25),
+                    )
+                    .await?;
+                    return Ok(ToolOutput::new(out));
+                }
+
                 let request = Request::CommStop {
                     id: REQUEST_ID,
                     session_id: ctx.session_id.clone(),
@@ -2750,6 +2954,74 @@ impl Tool for CommunicateTool {
             }
 
             "assign_task" => {
+                if let Some(raw_target) = params.target_session.as_deref() {
+                    let trimmed_target = raw_target.trim();
+                    if trimmed_target == "@ALL"
+                        || trimmed_target == "ALL"
+                        || (trimmed_target.starts_with('@')
+                            && crate::agichan::is_valid_handle(trimmed_target, true))
+                    {
+                        let wd = params
+                            .working_dir
+                            .as_deref()
+                            .map(std::path::PathBuf::from)
+                            .or_else(|| ctx.working_dir.clone());
+                        let lead = params
+                            .manager
+                            .as_deref()
+                            .map(|m| m.trim().trim_start_matches('@'))
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or("lead");
+                        if !crate::agichan::is_valid_handle(lead, false) {
+                            return Err(anyhow::anyhow!(
+                                "Invalid manager handle '{}' for federated assign_task",
+                                lead
+                            ));
+                        }
+                        let raw_task_id = params
+                            .task_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("t1");
+                        let agichan_id = crate::agichan::normalize_plan_id_for_agichan(raw_task_id);
+                        let title = params
+                            .message
+                            .as_deref()
+                            .or(params.prompt.as_deref())
+                            .or(params.initial_message.as_deref())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "'message' (task title/spec) is required when assigning to a federated agichan target ({})",
+                                    trimmed_target
+                                )
+                            })?;
+                        let target_arg = if trimmed_target.starts_with('@') {
+                            trimmed_target.to_string()
+                        } else {
+                            format!("@{trimmed_target}")
+                        };
+                        let args = vec![
+                            "manager".to_string(),
+                            "--as".to_string(),
+                            lead.to_string(),
+                            "assign".to_string(),
+                            agichan_id.clone(),
+                            target_arg.clone(),
+                            title.to_string(),
+                        ];
+                        let out = crate::agichan::run_agichan_command(
+                            wd.as_deref(),
+                            &args,
+                            std::time::Duration::from_secs(30),
+                        )
+                        .await?;
+                        return Ok(ToolOutput::new(out));
+                    }
+                }
+
                 let target = params
                     .target_session
                     .clone()
@@ -3146,7 +3418,7 @@ impl Tool for CommunicateTool {
             }
 
             _ => Err(anyhow::anyhow!(
-                "Unknown action '{}'. Valid actions: share, share_append, read, message, broadcast, dm, channel, list, list_channels, channel_members, \
+                "Unknown action '{}'. Valid actions: share, share_append, read, message, broadcast, dm, channel, list, roster, join_code, join, list_channels, channel_members, \
                  propose_plan, approve_plan, reject_plan, spawn, stop, assign_role, status, report, plan_status, summary, read_context, \
                  resync_plan, assign_task, assign_next, fill_slots, run_plan, cleanup, start, start_task, wake, resume, retry, reassign, replace, salvage, subscribe_channel, unsubscribe_channel, await_members. \
                  To read messages addressed to you, use action='read'.",

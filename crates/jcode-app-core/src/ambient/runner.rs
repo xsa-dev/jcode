@@ -135,6 +135,43 @@ impl AmbientRunnerHandle {
         false
     }
 
+    /// Inject an urgent system soft interrupt (e.g., from `AgichanChannel` SSE subscription)
+    /// into the active cycle's `SoftInterruptQueue`, or save as a directive and wake if idle.
+    pub async fn inject_system_soft_interrupt(
+        &self,
+        text: &str,
+        source: &str,
+        urgent: bool,
+    ) -> bool {
+        let queue = self.inner.active_cycle_queue.read().await;
+        if let Some(ref q) = *queue
+            && let Ok(mut q) = q.lock()
+        {
+            q.push(SoftInterruptMessage {
+                content: text.to_string(),
+                images: Vec::new(),
+                urgent,
+                source: SoftInterruptSource::System,
+                client_id: None,
+            });
+            logging::info(&format!(
+                "{} system soft interrupt injected into active cycle (urgent={}): {}",
+                source,
+                urgent,
+                crate::util::truncate_str(text, 60)
+            ));
+            return true;
+        }
+        drop(queue);
+
+        let source_id = format!("{}_{}", source, chrono::Utc::now().timestamp());
+        if let Err(e) = ambient::add_directive(text.to_string(), source_id) {
+            logging::error(&format!("Failed to save {} directive: {}", source, e));
+        }
+        self.trigger().await;
+        false
+    }
+
     /// Manually trigger an ambient cycle (returns immediately, cycle runs async).
     pub async fn trigger(&self) {
         // Set status to idle so should_run returns true

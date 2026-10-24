@@ -2602,6 +2602,45 @@ Re-run with `--force` if you really want to stop the server.";
     Ok(())
 }
 
+pub const MAX_RUN_STDIN_PROMPT_BYTES: usize = 16 * 1024 * 1024;
+
+pub fn resolve_run_message_input<R: Read>(
+    message: Option<&str>,
+    stdin_flag: bool,
+    reader: R,
+) -> Result<String> {
+    if stdin_flag && message.is_some_and(|m| m != "-") {
+        anyhow::bail!("`jcode run --stdin` cannot be combined with a positional message argument");
+    }
+    let read_from_stdin = stdin_flag || message == Some("-");
+    if !read_from_stdin {
+        let msg = message.ok_or_else(|| {
+            anyhow::anyhow!("`jcode run` requires a message argument or `--stdin` / `-`")
+        })?;
+        if msg.trim().is_empty() {
+            anyhow::bail!("`jcode run` message prompt cannot be empty");
+        }
+        return Ok(msg.to_string());
+    }
+
+    let mut buf = Vec::new();
+    reader
+        .take((MAX_RUN_STDIN_PROMPT_BYTES + 1) as u64)
+        .read_to_end(&mut buf)?;
+    if buf.len() > MAX_RUN_STDIN_PROMPT_BYTES {
+        anyhow::bail!(
+            "`jcode run` stdin prompt exceeds maximum size of {} MiB",
+            MAX_RUN_STDIN_PROMPT_BYTES / (1024 * 1024)
+        );
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|_| anyhow::anyhow!("`jcode run` stdin prompt must be valid UTF-8"))?;
+    if text.trim().is_empty() {
+        anyhow::bail!("`jcode run` stdin prompt is empty");
+    }
+    Ok(text)
+}
+
 pub async fn run_single_message_command(
     choice: &super::provider_init::ProviderChoice,
     model: Option<&str>,

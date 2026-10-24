@@ -297,9 +297,15 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         },
         Some(Command::Run {
             message,
+            stdin,
             json,
             ndjson,
         }) => {
+            let message = commands::resolve_run_message_input(
+                message.as_deref(),
+                stdin,
+                std::io::stdin().lock(),
+            )?;
             register_on_demand_server_spawner_for_run(
                 args.provider,
                 args.model.clone(),

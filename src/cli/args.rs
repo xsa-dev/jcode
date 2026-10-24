@@ -202,8 +202,13 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "json")]
         ndjson: bool,
 
-        /// The message to send
-        message: String,
+        /// Read the prompt from standard input instead of argv (or pass '-' as MESSAGE)
+        #[arg(long)]
+        stdin: bool,
+
+        /// The message to send (or '-' to read from standard input)
+        #[arg(required_unless_present = "stdin")]
+        message: Option<String>,
     },
 
     /// Login to a provider via OAuth, API key, or local credentials

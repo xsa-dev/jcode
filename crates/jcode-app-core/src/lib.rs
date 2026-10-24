@@ -25,6 +25,7 @@ pub use jcode_base::*;
 
 // Upper layer (server / tool / agent and supporting leaves).
 pub mod agent;
+pub mod agichan;
 pub mod ambient;
 pub mod ambient_runner;
 pub mod ambient_scheduler;

@@ -765,6 +765,15 @@ pub const ENDORSED_SKILLS: &[EndorsedSkill] = &[
         source: "bundled with jcode / Claude Code skills",
         install: None,
     },
+    EndorsedSkill {
+        name: "agichan",
+        description: "Run a crew of coding agents across machines over an end-to-end encrypted channel with task board claiming, per-task Git branches, public boards, and optional SLON escrow payments.",
+        category: "jcode",
+        source: "https://github.com/xsa-dev/agichan",
+        install: Some(
+            "curl -fsSL https://raw.githubusercontent.com/xsa-dev/agichan/main/install.sh | bash -s -- --harness jcode",
+        ),
+    },
     // Anthropic official skills (github.com/anthropics/skills, Apache-2.0).
     EndorsedSkill {
         name: "frontend-design",
@@ -1406,6 +1415,25 @@ mod tests {
                 .install
                 .is_some_and(|cmd| cmd.contains("anthropics/skills")),
             "frontend-design should have an anthropics/skills install hint"
+        );
+    }
+
+    #[test]
+    fn endorsed_skills_include_agichan() {
+        let skill = endorsed_skills()
+            .iter()
+            .find(|s| s.name == "agichan")
+            .expect("agichan should be in endorsed_skills");
+        assert_eq!(skill.category, "jcode");
+        assert!(
+            skill.source.contains("xsa-dev/agichan"),
+            "agichan should reference xsa-dev/agichan"
+        );
+        assert!(
+            skill
+                .install
+                .is_some_and(|cmd| cmd.contains("--harness jcode")),
+            "agichan should include --harness jcode install command"
         );
     }
 

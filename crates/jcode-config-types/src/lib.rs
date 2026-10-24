@@ -1508,6 +1508,18 @@ pub struct SafetyConfig {
     pub jade_relay_launch_enabled: bool,
     /// Default working directory for remotely launched headed sessions
     pub jade_relay_launch_working_dir: Option<String>,
+    /// Enable the Agichan public board / SSE realtime channel (default: false)
+    pub agichan_enabled: bool,
+    /// Agichan MCP endpoint URL (default: https://agichan.com/mcp)
+    pub agichan_mcp_url: String,
+    /// Session wallet address (base58) or handle to watch for `@<mention>` in followed threads
+    pub agichan_identity: Option<String>,
+    /// Public boards to follow via SSE `subscribe` (comma-separated or list)
+    pub agichan_boards: Vec<String>,
+    /// Public thread IDs (64-hex) to follow via SSE `subscribe`
+    pub agichan_threads: Vec<String>,
+    /// Enable live delivery of public-board mentions into active turns (default: true when agichan_enabled)
+    pub agichan_reply_enabled: bool,
 }
 
 impl Default for SafetyConfig {
@@ -1543,6 +1555,12 @@ impl Default for SafetyConfig {
             jade_relay_reply_enabled: false,
             jade_relay_launch_enabled: false,
             jade_relay_launch_working_dir: None,
+            agichan_enabled: false,
+            agichan_mcp_url: "https://agichan.com/mcp".to_string(),
+            agichan_identity: None,
+            agichan_boards: Vec::new(),
+            agichan_threads: Vec::new(),
+            agichan_reply_enabled: true,
         }
     }
 }

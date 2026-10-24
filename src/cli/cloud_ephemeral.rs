@@ -230,6 +230,79 @@ fn remote_command(command: &[String]) -> Result<String> {
         .join(" "))
 }
 
+fn valid_repo_url(repo: &str) -> bool {
+    !repo.is_empty()
+        && repo.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'@' | b':' | b'/' | b'.' | b'_' | b'~' | b'+' | b'-')
+        })
+}
+
+/// Build the remote shell command that joins an ephemeral cloud machine to an `agichan`
+/// E2EE channel using a one-time `agc1-...` code and starts `jcode` workers (`--agent jcode`).
+pub(crate) fn build_ephemeral_agichan_join_command(
+    join_code: &str,
+    manager: &str,
+    repo: &str,
+    workers: u32,
+    push: bool,
+) -> Result<Vec<String>> {
+    let code = join_code.trim();
+    if !crate::agichan::is_valid_join_code(code) {
+        bail!("invalid agichan join code (expected agc1-... URL-safe base64)");
+    }
+    let mgr = manager.trim().trim_start_matches('@');
+    if !crate::agichan::is_valid_handle(mgr, false) {
+        bail!("invalid agichan manager handle: {manager}");
+    }
+    let repo = repo.trim();
+    if !valid_repo_url(repo) {
+        bail!("invalid git repository URL: {repo}");
+    }
+    if !(1..=32).contains(&workers) {
+        bail!("workers must be between 1 and 32");
+    }
+    let push_arg = if push { " --push" } else { "" };
+    let script = format!(
+        "set -euo pipefail; \
+         export PATH=\"$HOME/.local/bin:/opt/jcode-cloud:$PATH\"; \
+         if ! command -v jcode >/dev/null 2>&1; then \
+           curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.sh | bash; \
+         fi; \
+         mkdir -p \"$HOME/work\" && cd \"$HOME/work\"; \
+         curl -fsSL https://raw.githubusercontent.com/slonana-labs/agichan/main/install.sh | bash -s -- \
+           --harness jcode --join {code} --dir \"$HOME/work\" --workers {workers} --manager {mgr} --agent jcode --repo {repo}{push_arg}"
+    );
+    Ok(vec!["bash".into(), "-lc".into(), script])
+}
+
+fn issue_local_join_code_for_ephemeral() -> Result<String> {
+    let data_dir = crate::agichan::agichan_data_dir();
+    let bin = crate::agichan::resolve_agichan_binary(data_dir.as_deref()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "agichan binary not found locally; pass --join-code agc1-... or install agichan"
+        )
+    })?;
+    let out = Command::new(&bin)
+        .args(["join-code", "--ttl", "24h"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("failed to execute {} join-code", bin.display()))?;
+    if !out.status.success() {
+        bail!(
+            "agichan join-code failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let code = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| crate::agichan::is_valid_join_code(line))
+        .ok_or_else(|| anyhow::anyhow!("agichan join-code did not return a valid agc1-... code"))?;
+    Ok(code.to_string())
+}
+
 pub(crate) fn run_cli(action: CloudEphemeralCommand) -> Result<()> {
     use CloudEphemeralCommand as C;
     match action {
@@ -333,6 +406,40 @@ pub(crate) fn run_cli(action: CloudEphemeralCommand) -> Result<()> {
                 bail!("remote command exited with {status}");
             }
         }
+        C::JoinSwarm {
+            id,
+            manager,
+            repo,
+            join_code,
+            workers,
+            push,
+        } => {
+            validate_id(&id)?;
+            let code = match join_code {
+                Some(c) => c,
+                None => issue_local_join_code_for_ephemeral()?,
+            };
+            let cmd = build_ephemeral_agichan_join_command(&code, &manager, &repo, workers, push)?;
+            let shell = remote_command(&cmd)?;
+            wait_ready(&id)?;
+            let status = Command::new("ssh")
+                .args(ssh_args(&id)?)
+                .args([
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=30",
+                    "--",
+                    &machine_host(&id)?,
+                    &shell,
+                ])
+                .status()
+                .context("bootstrap agichan jcode workers on ephemeral machine")?;
+            if !status.success() {
+                bail!("ephemeral agichan bootstrap exited with {status}");
+            }
+        }
         C::Proxy { id } => {
             let machine = connect(&id)?;
             cloud_managed::relay_proxy(
@@ -425,5 +532,56 @@ mod tests {
         assert!(machine.connection.ready);
         assert_eq!(machine.connection.host_keys.len(), 1);
         assert_eq!(serde_json::to_value(machine).unwrap()["state"], "running");
+    }
+
+    #[test]
+    fn ephemeral_agichan_join_command_validates_inputs_and_passes_jcode_agent() {
+        let cmd = build_ephemeral_agichan_join_command(
+            "agc1-YWJj_ZGVm-=",
+            "@lead",
+            "https://github.com/xsa-dev/jcode.git",
+            3,
+            true,
+        )
+        .expect("valid join command");
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], "-lc");
+        assert!(cmd[2].contains("--harness jcode"));
+        assert!(cmd[2].contains("--join agc1-YWJj_ZGVm-="));
+        assert!(cmd[2].contains("--workers 3"));
+        assert!(cmd[2].contains("--manager lead"));
+        assert!(cmd[2].contains("--agent jcode"));
+        assert!(cmd[2].contains("--repo https://github.com/xsa-dev/jcode.git --push"));
+
+        assert!(
+            build_ephemeral_agichan_join_command(
+                "not-a-code",
+                "lead",
+                "https://github.com/xsa-dev/jcode.git",
+                2,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            build_ephemeral_agichan_join_command(
+                "agc1-YWJj",
+                "ALL",
+                "https://github.com/xsa-dev/jcode.git",
+                2,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            build_ephemeral_agichan_join_command(
+                "agc1-YWJj",
+                "lead",
+                "https://github.com/o/r.git;rm -rf /",
+                2,
+                true
+            )
+            .is_err()
+        );
     }
 }

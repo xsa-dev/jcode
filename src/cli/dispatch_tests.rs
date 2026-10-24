@@ -402,3 +402,62 @@ auth = "none"
         ProviderChoice::OpenaiCompatible
     ));
 }
+
+#[test]
+fn resolve_run_message_input_supports_stdin_dash_and_rejects_empty() {
+    use std::io::Read;
+    let from_dash = commands::resolve_run_message_input(
+        Some("-"),
+        false,
+        std::io::Cursor::new(b"task prompt\nSTATUS: done\n"),
+    )
+    .expect("read prompt via '-'");
+    assert_eq!(from_dash, "task prompt\nSTATUS: done\n");
+
+    let from_flag =
+        commands::resolve_run_message_input(None, true, std::io::Cursor::new(b"from --stdin"))
+            .expect("read prompt via --stdin");
+    assert_eq!(from_flag, "from --stdin");
+
+    let positional = commands::resolve_run_message_input(
+        Some("direct message"),
+        false,
+        std::io::Cursor::new(b"ignored"),
+    )
+    .expect("positional message");
+    assert_eq!(positional, "direct message");
+
+    assert!(
+        commands::resolve_run_message_input(Some("-"), false, std::io::Cursor::new(b"   \n\t"))
+            .is_err(),
+        "empty/whitespace stdin prompt must be rejected"
+    );
+    assert!(
+        commands::resolve_run_message_input(Some("both"), true, std::io::Cursor::new(b"stdin"))
+            .is_err(),
+        "--stdin combined with a positional message must be rejected"
+    );
+    assert!(
+        commands::resolve_run_message_input(
+            Some("-"),
+            true,
+            std::io::Cursor::new(b"both flags ok when dash")
+        )
+        .is_ok(),
+        "--stdin combined with '-' should succeed"
+    );
+    assert!(
+        commands::resolve_run_message_input(
+            Some("-"),
+            false,
+            std::io::Cursor::new([0xff, 0xfe, 0xfd])
+        )
+        .is_err(),
+        "invalid UTF-8 on stdin must be rejected"
+    );
+    let oversized = std::io::repeat(b'a').take((commands::MAX_RUN_STDIN_PROMPT_BYTES + 1) as u64);
+    assert!(
+        commands::resolve_run_message_input(Some("-"), false, oversized).is_err(),
+        "stdin prompt exceeding 16 MiB must be rejected"
+    );
+}

@@ -56,6 +56,27 @@ pub(crate) enum CloudEphemeralCommand {
         #[arg(last = true, required = true, num_args = 1..)]
         command: Vec<String>,
     },
+    /// Bootstrap an ephemeral machine into the coordinator's agichan E2EE channel
+    /// using a one-time join code and start jcode workers (`--agent jcode --push`).
+    JoinSwarm {
+        /// Ephemeral machine ID (`cm_<32 lowercase hex digits>`).
+        id: String,
+        /// Manager handle (`@<handle>`) whose tasks the remote workers will execute.
+        #[arg(long)]
+        manager: String,
+        /// Git repository URL for the remote workers to clone.
+        #[arg(long)]
+        repo: String,
+        /// One-time `agc1-...` join code. When omitted, `agichan join-code` is invoked locally.
+        #[arg(long)]
+        join_code: Option<String>,
+        /// Number of parallel `jcode` workers to launch on the ephemeral VM (1..=32).
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=32))]
+        workers: u32,
+        /// Push completed `agichan/<task_id>` branches to origin (default: true).
+        #[arg(long, default_value_t = true)]
+        push: bool,
+    },
     /// Internal SSH ProxyCommand for one ephemeral machine.
     #[command(hide = true)]
     Proxy { id: String },

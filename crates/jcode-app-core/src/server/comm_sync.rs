@@ -398,11 +398,12 @@ pub(super) async fn handle_comm_plan_status(
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let swarm_id = {
+    let (swarm_id, working_dir) = {
         let members = swarm_members.read().await;
-        members
-            .get(&req_session_id)
-            .and_then(|member| member.swarm_id.clone())
+        match members.get(&req_session_id) {
+            Some(member) => (member.swarm_id.clone(), member.working_dir.clone()),
+            None => (None, None),
+        }
     };
 
     let Some(swarm_id) = swarm_id else {
@@ -413,6 +414,25 @@ pub(super) async fn handle_comm_plan_status(
         });
         return;
     };
+
+    if let Some(ref cwd) = working_dir
+        && crate::agichan::resolve_project_room(cwd, None).is_some()
+        && let Ok((_room, snapshot)) =
+            crate::agichan::fetch_room_board_json(Some(cwd), None, None).await
+    {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut plans = swarm_plans.write().await;
+        if let Some(plan) = plans.get_mut(&swarm_id) {
+            let report =
+                crate::agichan::sync_board_into_versioned_plan(&snapshot, plan, None, now_ms);
+            if !report.updated_item_ids.is_empty() {
+                super::swarm_todo_link::sync_plan(&req_session_id, &plan.items);
+            }
+        }
+    }
 
     let summary = {
         let plans = swarm_plans.read().await;
@@ -432,18 +452,36 @@ pub(super) async fn handle_comm_resync_plan(
     req_session_id: String,
     ctx: &CommResyncPlanContext<'_>,
 ) {
-    let swarm_id = {
+    let (swarm_id, working_dir) = {
         let members = ctx.swarm_members.read().await;
-        members
-            .get(&req_session_id)
-            .and_then(|member| member.swarm_id.clone())
+        match members.get(&req_session_id) {
+            Some(member) => (member.swarm_id.clone(), member.working_dir.clone()),
+            None => (None, None),
+        }
     };
 
     if let Some(swarm_id) = swarm_id {
+        let board_snapshot = if let Some(ref cwd) = working_dir
+            && crate::agichan::resolve_project_room(cwd, None).is_some()
+        {
+            crate::agichan::fetch_room_board_json(Some(cwd), None, None)
+                .await
+                .ok()
+                .map(|(_, b)| b)
+        } else {
+            None
+        };
         let plan_state = {
             let mut plans = ctx.swarm_plans.write().await;
             plans.get_mut(&swarm_id).map(|plan| {
                 plan.participants.insert(req_session_id.clone());
+                if let Some(ref board) = board_snapshot {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    crate::agichan::sync_board_into_versioned_plan(board, plan, None, now_ms);
+                }
                 (plan.version, plan.items.len())
             })
         };

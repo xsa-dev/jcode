@@ -789,11 +789,13 @@ fn run_json_subcommand_parses() {
         Some(Command::Run {
             json,
             ndjson,
+            stdin,
             message,
         }) => {
             assert!(json);
             assert!(!ndjson);
-            assert_eq!(message, "hello");
+            assert!(!stdin);
+            assert_eq!(message.as_deref(), Some("hello"));
         }
         other => panic!("unexpected command: {:?}", other),
     }
@@ -806,14 +808,39 @@ fn run_ndjson_subcommand_parses() {
         Some(Command::Run {
             json,
             ndjson,
+            stdin,
             message,
         }) => {
             assert!(!json);
             assert!(ndjson);
-            assert_eq!(message, "hello");
+            assert!(!stdin);
+            assert_eq!(message.as_deref(), Some("hello"));
         }
         other => panic!("unexpected command: {:?}", other),
     }
+}
+
+#[test]
+fn run_stdin_and_dash_subcommand_parses() {
+    let dash_args = Args::try_parse_from(["jcode", "run", "-"]).unwrap();
+    match dash_args.command {
+        Some(Command::Run { stdin, message, .. }) => {
+            assert!(!stdin);
+            assert_eq!(message.as_deref(), Some("-"));
+        }
+        other => panic!("unexpected command: {:?}", other),
+    }
+
+    let stdin_args = Args::try_parse_from(["jcode", "run", "--stdin"]).unwrap();
+    match stdin_args.command {
+        Some(Command::Run { stdin, message, .. }) => {
+            assert!(stdin);
+            assert!(message.is_none());
+        }
+        other => panic!("unexpected command: {:?}", other),
+    }
+
+    assert!(Args::try_parse_from(["jcode", "run"]).is_err());
 }
 
 #[test]

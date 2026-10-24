@@ -37,6 +37,7 @@ impl Agent {
         let _runtime_activity = crate::runtime_activity::global().try_enter()?;
         self.announce_late_mcp_tools().await;
         self.announce_late_skills();
+        self.maybe_inject_agichan_turn_digest().await?;
         let input_id = self.add_message(
             Role::User,
             vec![ContentBlock::Text {
@@ -77,6 +78,7 @@ impl Agent {
         let _runtime_activity = crate::runtime_activity::global().try_enter()?;
         self.announce_late_mcp_tools().await;
         self.announce_late_skills();
+        self.maybe_inject_agichan_turn_digest().await?;
         let input_id = self.add_message_with_display_role(
             Role::User,
             vec![ContentBlock::Text {
@@ -162,6 +164,9 @@ impl Agent {
         };
         self.announce_late_mcp_tools().await;
         self.announce_late_skills();
+        if !continues_turn {
+            self.maybe_inject_agichan_turn_digest().await?;
+        }
         self.append_user_context_message_with_display_role(
             &user_message,
             images,
@@ -224,6 +229,31 @@ impl Agent {
             Some(crate::session::StoredDisplayRole::System),
         );
         self.session.save()
+    }
+
+    /// Check whether this session's workspace has an active `agichan` room and,
+    /// at most once per `MIN_GAP_SECS` (60s), inject the framed untrusted digest
+    /// if the SHA-256 digest changed or unanswered mentions remain.
+    /// Skipped when `JCODE_RUN_MCP=0` (e.g. inside a sandboxed `agichan` worker).
+    async fn maybe_inject_agichan_turn_digest(&mut self) -> Result<()> {
+        if std::env::var("JCODE_RUN_MCP").ok().is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        }) {
+            return Ok(());
+        }
+        if let Some(digest) = crate::agichan::poll_turn_digest_for_session(
+            &self.session.id,
+            self.session.working_dir.as_deref(),
+            self.session.short_name.as_deref(),
+        )
+        .await
+        {
+            self.append_turn_system_reminder(&digest)?;
+        }
+        Ok(())
     }
 
     /// Append and persist a user message without starting a model turn.
