@@ -2,8 +2,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use super::provider_init::ProviderChoice;
 
+mod cloud_ephemeral;
 mod google;
 mod mcp;
+pub(crate) use cloud_ephemeral::CloudEphemeralCommand;
 #[allow(unused_imports)]
 pub(crate) use google::{GoogleAccessTierArg, GoogleLoginArgs};
 pub(crate) use mcp::McpCommand;
@@ -719,10 +721,24 @@ pub(crate) enum ServerCommand {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum CloudCommand {
+    /// Manage disposable remote machines with mandatory automatic expiry.
+    Ephemeral {
+        #[command(subcommand)]
+        action: CloudEphemeralCommand,
+    },
     /// Upload, list, verify, and view cloud-synced sessions
     Sessions {
         #[command(subcommand)]
         action: CloudSessionsCommand,
+    },
+
+    /// Prepare the destination without reading or moving a live session.
+    #[command(hide = true)]
+    Prepare {
+        #[command(flatten)]
+        target: CloudMoveTarget,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Move a live session (transcript, repo state, env notes) to a cloud host
@@ -802,6 +818,11 @@ pub(crate) enum CloudCommand {
         #[arg(long)]
         export: bool,
     },
+
+    /// Internal: import the account router's API keys, provider token stores
+    /// and auto-switch pool from stdin over the private SSH channel.
+    #[command(hide = true)]
+    RouterCredentials,
 
     /// Internal: remote side of `cloud move` (reads a bundle tarball on stdin).
     #[command(hide = true)]

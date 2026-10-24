@@ -1105,6 +1105,7 @@ async fn broadcast_plan_alert(ctx: &ToolContext, message: &str) -> Result<()> {
         delivery: None,
         tldr: Some("run_plan paused: credential failure wave; fix auth then retry".to_string()),
         to_swarm: None,
+        require_target: false,
     };
     match send_request(request).await {
         Ok(response) => ensure_success(&response),
@@ -1682,7 +1683,6 @@ const ADVERTISED_SWARM_ACTIONS: &[&str] = &[
     "launch",
     "spawn",
     "message",
-    "dm",
     "report",
     "status",
     "plan_status",
@@ -1694,7 +1694,6 @@ const ADVERTISED_SWARM_ACTIONS: &[&str] = &[
     "retry",
     "list_models",
     "list_swarms",
-    "set_swarm_label",
 ];
 
 #[derive(Clone, Deserialize)]
@@ -1823,7 +1822,9 @@ fn canonical_swarm_action(action: &str) -> &str {
     match action.trim().to_ascii_lowercase().as_str() {
         "inbox" | "messages" | "check_messages" | "read_messages" | "read_inbox" => "read",
         "send" | "msg" | "send_message" => "message",
-        "dm_session" | "direct_message" | "whisper" => "dm",
+        // `dm` was its own action; `message` with `to_session` is identical,
+        // so route it there (one way to talk to an agent).
+        "dm" | "dm_session" | "direct_message" | "whisper" => "message",
         "broadcast_all" | "announce" => "broadcast",
         "agents" | "members" | "list_agents" | "list_members" | "roster" => "list",
         "swarms" | "list_swarm" | "swarm_list" => "list_swarms",
@@ -1855,11 +1856,11 @@ impl Tool for CommunicateTool {
                 "action": {
                     "type": "string",
                     "enum": ADVERTISED_SWARM_ACTIONS,
-                    "description": "Action. launch runs your todo list (one agent per lane). spawn starts one worker on a lane; spawn requires label and should include prompt. message sends to to_session, a channel, or everyone. list_models shows available models/routes."
+                    "description": "Action. launch runs your todo list (one agent per lane). spawn starts one worker on a lane; spawn requires label and should include prompt. message sends to one agent (to_session) or a channel; only the coordinator may omit both to message everyone. list_models shows available models/routes."
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message body: DM with to_session, channel post with channel, else broadcast. For report, the body."
+                    "description": "Message body. Goes to to_session, or to channel; with neither, everyone (coordinator only). For report, the body."
                 },
                 "tldr": {
                     "type": "string",
@@ -1896,7 +1897,7 @@ impl Tool for CommunicateTool {
                 "label": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Required for spawn: the worker's lane name (e.g. 'auth refactor'). Each spawned worker owns that lane in your todo list (created from the prompt if missing); its todo list is the lane and syncs only it. For set_swarm_label: the new unique label."
+                    "description": "Required for spawn: the worker's lane name (e.g. 'auth refactor'). Each spawned worker owns that lane in your todo list (created from the prompt if missing); its todo list is the lane and syncs only it."
                 },
                 "phase": {
                     "type": "integer",
@@ -2116,6 +2117,9 @@ impl Tool for CommunicateTool {
                     delivery: params.delivery,
                     tldr,
                     to_swarm: to_swarm.clone(),
+                    // A worker that forgets `to_session` gets an error rather
+                    // than broadcasting; the coordinator may still message all.
+                    require_target: true,
                 };
 
                 match send_request(request).await {
@@ -2168,6 +2172,7 @@ impl Tool for CommunicateTool {
                     delivery: params.delivery,
                     tldr,
                     to_swarm: None,
+                    require_target: false,
                 };
 
                 match send_request(request).await {
@@ -2206,6 +2211,7 @@ impl Tool for CommunicateTool {
                     wake: params.wake,
                     tldr,
                     to_swarm: to_swarm.clone(),
+                    require_target: false,
                 };
 
                 match send_request(request).await {
@@ -2249,6 +2255,7 @@ impl Tool for CommunicateTool {
                     wake: params.wake,
                     tldr,
                     to_swarm: None,
+                    require_target: false,
                 };
 
                 match send_request(request).await {
@@ -3119,8 +3126,10 @@ impl Tool for CommunicateTool {
                                 "\n\n(You can keep working; this wait runs in the background.)"
                             };
                             return Ok(ToolOutput::new(format!(
-                                "{}{}",
-                                summary, compatibility_note
+                                "{}{}\n\n{}",
+                                summary,
+                                compatibility_note,
+                                super::BACKGROUND_WAIT_GUIDANCE
                             )));
                         }
                         let reports = fetch_awaited_member_reports(&ctx, &members).await;

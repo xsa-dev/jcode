@@ -16,6 +16,62 @@ use std::collections::HashMap;
 
 pub struct TodoTool;
 
+/// Validate the entire replacement before touching either todo storage or
+/// background delivery. A terminal dependency remains valid but needs no wake.
+async fn prepare_background_dependencies(
+    manager: &crate::background::BackgroundTaskManager,
+    session_id: &str,
+    previous: &[TodoItem],
+    todos: &[TodoItem],
+) -> Result<()> {
+    let mut ids: HashMap<&str, (bool, bool)> = HashMap::new();
+    for todo in todos {
+        let prior = previous.iter().find(|old| old.id == todo.id);
+        let active = !crate::todo::todo_status_is_completed(&todo.status)
+            && !crate::todo::todo_status_is_cancelled(&todo.status);
+        for id in &todo.waiting_on {
+            // Check before the manager constructs any filesystem path.
+            if id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+            {
+                bail!("Invalid waiting_on background task ID: {id}");
+            }
+            let is_new = !prior.is_some_and(|old| old.waiting_on.contains(id));
+            let entry = ids.entry(id).or_default();
+            entry.0 |= is_new;
+            entry.1 |= active;
+        }
+    }
+    let mut running = Vec::new();
+    for (id, (is_new, active)) in ids {
+        let Some(task) = manager.status(id).await else {
+            if is_new {
+                bail!("Unknown waiting_on background task: {id}");
+            }
+            // Cleanup can remove historical task files. Retaining that same
+            // todo's reference must not prevent unrelated or assessment writes.
+            continue;
+        };
+        if task.task_id != id {
+            bail!("Unknown waiting_on background task: {id}");
+        }
+        if task.session_id != session_id {
+            bail!("waiting_on background task does not belong to this session: {id}");
+        }
+        if active && task.status == crate::bus::BackgroundTaskStatus::Running {
+            running.push(id);
+        }
+    }
+    for id in running {
+        // The task may finish between validation and subscription. Terminal
+        // dependencies do not block, and callers re-read current task state.
+        manager.update_delivery(id, true, true).await?;
+    }
+    Ok(())
+}
+
 impl TodoTool {
     pub fn new() -> Self {
         Self
@@ -70,6 +126,38 @@ fn merge_confidence_history(previous: &[TodoItem], incoming: &mut [TodoItem]) {
             todo.assigned_to = previous_todo.and_then(|prev| prev.assigned_to.clone());
         }
     }
+}
+
+/// How a todo call wrote, for measuring whether agents use incremental edits
+/// instead of resending the list. Counted locally in
+/// `~/.jcode/stats/todo-write-modes.json`; nothing leaves the machine.
+fn todo_write_mode(input: &Value) -> &'static str {
+    let has = |key: &str| input.get(key).is_some_and(|value| !value.is_null());
+    match (has("todos"), has("update") || has("add") || has("remove")) {
+        (true, _) => "full",
+        (false, true) => "patch",
+        (false, false) if has("goals") || has("plan") => "assessment",
+        _ => "read",
+    }
+}
+
+fn record_todo_write_mode(input: &Value) {
+    static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_guard) = COUNTER_LOCK.lock() else {
+        return;
+    };
+    let mode = todo_write_mode(input);
+    let Ok(dir) = crate::storage::jcode_dir().map(|dir| dir.join("stats")) else {
+        return;
+    };
+    let path = dir.join("todo-write-modes.json");
+    let mut counts: HashMap<String, u64> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    *counts.entry(mode.to_string()).or_default() += 1;
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = crate::storage::write_json_fast(&path, &counts);
 }
 
 /// Turn incremental edits into a full `todos` list so every downstream rule
@@ -136,7 +224,14 @@ fn apply_todo_patch(mut input: Value, stored: impl FnOnce() -> Value) -> Result<
         let target = todo.as_object_mut().expect("stored todo is an object");
         for (key, value) in fields {
             if key != "id" {
-                target.insert(key.clone(), value.clone());
+                // `phase`/`lane` are the card's words for `stage`/`group`;
+                // write the canonical key so an alias never sits beside it.
+                let key = match key.as_str() {
+                    "phase" | "wave" => "stage",
+                    "lane" => "group",
+                    other => other,
+                };
+                target.insert(key.to_string(), value.clone());
             }
         }
     }
@@ -834,15 +929,15 @@ impl Tool for TodoTool {
         // deliberately handwritten. Never generate it from gate constants or
         // interpolate private thresholds, because that would teach the model
         // how to target the evaluator instead of reporting an honest assessment.
-        "Read or update structured todo items and optional goal-level assessments. \
-         Use this tool VERY frequently, far more than feels necessary. The user watches \
-         todo progress live, so a stale list looks like stalled work. For any task with \
-         more than one step: write the full plan before starting, mark an item \
-         in_progress before working on it, mark it completed the moment it is done \
-         (never batch completions), and add newly discovered work as soon as you find it. \
-         Write the full list once with `todos`; after that use `update` (by id) to change \
-         status or fields, `add` for new work, and `remove` rarely, instead of resending \
-         the whole list. Expect to call this after nearly every meaningful step."
+        "Read or update todos and goal assessments. For multi-step work, write the plan \
+         once with `todos`. Then use `update` by id for status/field changes and `add` \
+         for new work. Reserve full replacement for restructuring; remove rarely. \
+         Mark work in_progress before starting and completed as soon as it is done. \
+         Keep the live list current after meaningful steps. Use short titles, with \
+         longer context in details. Organize parallel lanes within sequential phases. \
+         Set waiting_on to existing background task IDs from this session when work \
+         must wait. They block only while running, never after completion. Saving \
+         enables completion notify/wake. Use [] or null to clear waiting_on."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -889,6 +984,11 @@ impl Tool for TodoTool {
                                 "type": "string",
                                 "description": "Optional longer brief: files, acceptance criteria, context. Not shown on the card; given to a swarm worker that takes this todo."
                             },
+                            "waiting_on": {
+                                "type": ["array", "null"],
+                                "items": {"type": "string"},
+                                "description": "Existing background task IDs in this session. Block only while running, never after completion. Enables completion notify/wake. [] or null clears."
+                            },
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed", "cancelled"],
@@ -902,14 +1002,14 @@ impl Tool for TodoTool {
                                 "type": "string",
                                 "description": "ID."
                             },
-                            "group": {
+                            "lane": {
                                 "type": "string",
                                 "description": "Optional lane name: one lane per coherent goal; todos in a lane run in order and one swarm agent owns a lane. Omit for flat list."
                             },
-                            "stage": {
+                            "phase": {
                                 "type": "integer",
                                 "minimum": 1,
-                                "description": "Optional phase (1, 2, 3...). Phase 2 starts after phase 1 is done. Inside a phase, lanes (todos sharing a group) run in parallel. Omit when steps must happen in list order."
+                                "description": "Optional phase (1, 2, 3...). Phase 2 starts after phase 1 is done. Inside a phase, lanes (todos sharing a lane) run in parallel. Omit when steps must happen in list order."
                             },
                             "confidence": {
                                 "type": "string",
@@ -1013,10 +1113,13 @@ impl Tool for TodoTool {
             "description": "Existing todo id to insert after."
         });
         schema["properties"]["add"]["items"]["properties"] = add_properties;
+        schema["properties"]["update"]["items"]["properties"]["waiting_on"] =
+            schema["properties"]["todos"]["items"]["properties"]["waiting_on"].clone();
         schema
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        let write_mode_input = input.clone();
         let input = apply_todo_patch(input, || {
             serde_json::to_value(load_todos(&ctx.session_id).unwrap_or_default())
                 .unwrap_or(Value::Array(Vec::new()))
@@ -1028,6 +1131,14 @@ impl Tool for TodoTool {
             // Goals/plan-only writes keep the stored todo list.
             let previous = load_todos(&ctx.session_id).unwrap_or_default();
             let mut todos = params.todos.unwrap_or_else(|| previous.clone());
+            prepare_background_dependencies(
+                crate::background::global(),
+                &ctx.session_id,
+                &previous,
+                &todos,
+            )
+            .await?;
+            record_todo_write_mode(&write_mode_input);
             merge_confidence_history(&previous, &mut todos);
             (|| {
                 let stored_goals = load_goals(&ctx.session_id).unwrap_or_default();
@@ -1099,6 +1210,7 @@ impl Tool for TodoTool {
                 )
             })()
         } else {
+            record_todo_write_mode(&write_mode_input);
             (|| {
                 let todos = load_todos(&ctx.session_id)?;
                 let goals = load_goals(&ctx.session_id).unwrap_or_default();
@@ -1179,6 +1291,10 @@ mod tests {
             .get("properties")
             .and_then(|v| v.as_object())
             .expect("todo item should advertise properties");
+        assert!(item_props.contains_key("phase"));
+        assert!(item_props.contains_key("lane"));
+        assert!(!item_props.contains_key("stage"));
+        assert!(!item_props.contains_key("group"));
         assert!(item_props.contains_key("confidence"));
         assert!(item_props.contains_key("completion_confidence"));
         assert!(!item_props.contains_key("closed_feedback_loop"));
@@ -1851,10 +1967,271 @@ mod tests {
         }
     }
 
+    #[test]
+    fn waiting_on_patch_supports_set_and_clear() {
+        let initial = json!([{"id":"a", "content":"A", "status":"pending", "priority":"high", "waiting_on":["old"]}]);
+        for waiting_on in [json!(["new"]), json!([]), Value::Null] {
+            let input = apply_todo_patch(
+                json!({"update":[{"id":"a", "waiting_on":waiting_on}]}),
+                || initial.clone(),
+            )
+            .unwrap();
+            let parsed = parse_todo_input(input).unwrap();
+            let actual = &parsed.todos.unwrap()[0].waiting_on;
+            assert_eq!(
+                actual,
+                &if waiting_on.is_null() {
+                    vec![]
+                } else {
+                    serde_json::from_value::<Vec<String>>(waiting_on).unwrap()
+                }
+            );
+        }
+        let input = apply_todo_patch(json!({"add":[{"id":"b", "content":"B", "status":"pending", "priority":"high", "waiting_on":["new"]}]}), || initial.clone()).unwrap();
+        assert_eq!(
+            parse_todo_input(input).unwrap().todos.unwrap()[1].waiting_on,
+            vec!["new"]
+        );
+    }
+
+    #[tokio::test]
+    async fn background_dependencies_validate_session_and_arm_wake() {
+        let manager = crate::background::BackgroundTaskManager::new();
+        let session = format!("todo-dependency-{}", uuid::Uuid::new_v4());
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let task = manager
+            .spawn_with_notify("test", None, &session, false, false, |_| async move {
+                let _ = wait.await;
+                Ok(crate::background::TaskResult::completed(Some(0)))
+            })
+            .await;
+        let item = TodoItem {
+            waiting_on: vec![task.task_id.clone()],
+            ..Default::default()
+        };
+        assert!(
+            prepare_background_dependencies(
+                &manager,
+                "other-session",
+                &[],
+                std::slice::from_ref(&item)
+            )
+            .await
+            .is_err()
+        );
+        let unknown = TodoItem {
+            waiting_on: vec!["missing-task".into()],
+            ..Default::default()
+        };
+        assert!(
+            prepare_background_dependencies(&manager, &session, &[], &[item.clone(), unknown])
+                .await
+                .is_err()
+        );
+        let status = manager.status(&task.task_id).await.unwrap();
+        assert!(
+            !status.notify && !status.wake,
+            "invalid writes must not change delivery"
+        );
+        for status in ["completed", "cancelled"] {
+            let mut closed = item.clone();
+            closed.status = status.into();
+            prepare_background_dependencies(&manager, &session, &[], &[closed])
+                .await
+                .unwrap();
+            let delivery = manager.status(&task.task_id).await.unwrap();
+            assert!(
+                !delivery.notify && !delivery.wake,
+                "closed todos must not arm wakes"
+            );
+        }
+        prepare_background_dependencies(&manager, &session, &[], std::slice::from_ref(&item))
+            .await
+            .unwrap();
+        let status = manager.status(&task.task_id).await.unwrap();
+        assert!(status.notify && status.wake);
+        let mut events = Bus::global().subscribe();
+        release.send(()).unwrap();
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let BusEvent::BackgroundTaskCompleted(event) = events.recv().await.unwrap()
+                    && event.task_id == task.task_id
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("completion must be delivered without a TUI");
+        assert!(completion.notify && completion.wake);
+        assert_eq!(
+            manager.status(&task.task_id).await.unwrap().status,
+            crate::bus::BackgroundTaskStatus::Completed
+        );
+        prepare_background_dependencies(&manager, &session, &[], &[item])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_background_dependencies_do_not_write_state() {
+        let _guard = crate::storage::lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let dir = tempfile::TempDir::new().unwrap();
+        crate::env::set_var("JCODE_HOME", dir.path());
+        let session = format!("todo-invalid-dependency-{}", uuid::Uuid::new_v4());
+        let task = crate::background::global()
+            .spawn("test", "different-session", |_| async {
+                Ok(crate::background::TaskResult::completed(Some(0)))
+            })
+            .await;
+        for id in [
+            "missing-task",
+            "",
+            "../escape",
+            "/absolute",
+            "a/b",
+            "a\\b",
+            "a.b",
+            task.task_id.as_str(),
+        ] {
+            let result = TodoTool::new().execute(json!({
+                "todos":[{"id":"a", "content":"A", "status":"pending", "priority":"high", "waiting_on":[id]}],
+                "plan":{"user_intention":"must not be saved"},
+                "goals":[{"feedback_loop":"must not be saved"}]
+            }), test_ctx(&session)).await;
+            assert!(result.is_err());
+            if id.contains(['/', '\\', '.']) {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Invalid waiting_on")
+                );
+            }
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                0,
+                "rejected dependencies must not persist todos, assessments, or write statistics"
+            );
+        }
+        if let Some(home) = previous_home {
+            crate::env::set_var("JCODE_HOME", home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_historical_dependencies_allow_unrelated_writes_but_not_new_refs() {
+        let _guard = crate::storage::lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let dir = tempfile::TempDir::new().unwrap();
+        crate::env::set_var("JCODE_HOME", dir.path());
+        let session = "todo-retained-missing-background";
+        let stored = vec![
+            TodoItem {
+                id: "old".into(),
+                content: "old".into(),
+                status: "completed".into(),
+                priority: "high".into(),
+                waiting_on: vec!["removed-bg-task".into()],
+                ..Default::default()
+            },
+            TodoItem {
+                id: "other".into(),
+                content: "other".into(),
+                status: "pending".into(),
+                priority: "high".into(),
+                ..Default::default()
+            },
+        ];
+        save_todos(session, &stored).unwrap();
+        let tool = TodoTool::new();
+        tool.execute(
+            json!({"plan":{"user_intention":"assessment update"}}),
+            test_ctx(session),
+        )
+        .await
+        .unwrap();
+        tool.execute(
+            json!({"update":[{"id":"other", "status":"in_progress"}]}),
+            test_ctx(session),
+        )
+        .await
+        .unwrap();
+        let before = load_todos(session).unwrap();
+        assert_eq!(before[0].waiting_on, vec!["removed-bg-task"]);
+        assert!(
+            tool.execute(
+                json!({"update":[{"id":"other", "waiting_on":["removed-bg-task"]}]}),
+                test_ctx(session)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(load_todos(session).unwrap(), before);
+        match previous_home {
+            Some(home) => crate::env::set_var("JCODE_HOME", home),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+    }
+
     /// Issue #695, the visibly-stale case. The todos panel renders the
     /// ungrouped goal unconditionally (not only as a group header), so an
     /// ungrouped goal left over from a previous flat todo list is exactly what
     /// the reporter saw frozen in the panel.
+    #[tokio::test]
+    async fn patch_mode_accepts_phase_and_lane_and_counts_write_modes() {
+        let _guard = crate::storage::lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", dir.path());
+        let session = "todo-phase-lane";
+        let tool = TodoTool::new();
+
+        // Full write using the card's words.
+        tool.execute(
+            json!({"todos": [{"content": "a", "status": "pending", "priority": "high",
+                              "id": "a", "confidence": "plausible",
+                              "phase": 2, "lane": "parser"}]}),
+            test_ctx(session),
+        )
+        .await
+        .expect("full write with phase/lane");
+        let todos = load_todos(session).unwrap();
+        assert_eq!(todos[0].stage, Some(2));
+        assert_eq!(todos[0].group.as_deref(), Some("parser"));
+
+        // Patch moving it with the same words.
+        tool.execute(
+            json!({"update": [{"id": "a", "phase": 3, "lane": "ui"}]}),
+            test_ctx(session),
+        )
+        .await
+        .expect("patch with phase/lane");
+        let todos = load_todos(session).unwrap();
+        assert_eq!(todos[0].stage, Some(3));
+        assert_eq!(todos[0].group.as_deref(), Some("ui"));
+
+        tool.execute(json!({}), test_ctx(session))
+            .await
+            .expect("read");
+        let counts: HashMap<String, u64> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("stats/todo-write-modes.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(counts.get("full"), Some(&1));
+        assert_eq!(counts.get("patch"), Some(&1));
+        assert_eq!(counts.get("read"), Some(&1));
+
+        if let Some(home) = previous_home {
+            crate::env::set_var("JCODE_HOME", home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
     #[tokio::test]
     async fn patch_mode_updates_adds_and_removes_without_resending_the_list() {
         let _guard = crate::storage::lock_test_env();

@@ -468,6 +468,7 @@ fn test_remote_jcode_subscription_catalog_is_not_augmented_with_local_auth_route
             expected,
             std::collections::BTreeSet::from([
                 "claude-opus-5-5",
+                "claude-sonnet-4-6",
                 "claude-sonnet-5-5",
                 "claude-haiku-5-5",
                 "gpt-6.1-sol",
@@ -1419,6 +1420,7 @@ fn test_create_transfer_session_from_parent_copies_todos_and_uses_compacted_cont
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
+                waiting_on: vec!["parent-build-task".to_string()],
             }],
         )
         .expect("save todos");
@@ -1441,6 +1443,11 @@ fn test_create_transfer_session_from_parent_copies_todos_and_uses_compacted_cont
         assert_eq!(child.working_dir.as_deref(), Some("/tmp"));
         assert_eq!(child_todos.len(), 1);
         assert_eq!(child_todos[0].content, "Carry this forward");
+        assert!(child_todos[0].waiting_on.is_empty());
+        assert_eq!(
+            crate::todo::load_todos(&app.session.id).unwrap()[0].waiting_on,
+            ["parent-build-task"]
+        );
         for prompt in [None, Some("")] {
             app.session.system_prompt = prompt.map(str::to_string);
             let (child_id, _) = super::commands::create_transfer_session_from_parent(
@@ -1598,6 +1605,7 @@ fn test_escape_interrupt_disables_auto_poke_while_processing() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
+                waiting_on: Vec::new(),
             },
         ]));
 

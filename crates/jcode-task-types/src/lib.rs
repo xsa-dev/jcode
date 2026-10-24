@@ -438,7 +438,8 @@ pub struct TodoItem {
     /// Optional group label. Todos that share a group are displayed together
     /// under a single header. Use one group per coherent goal; when work is
     /// steered into a new area, start a new group instead of renaming.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Also accepted as `lane`: the lane this todo belongs to.
+    #[serde(default, alias = "lane", skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// Forward-looking evidence state that this todo can be completed
     /// correctly. Legacy sessions stored a 0-100 score; numbers map onto the
@@ -458,6 +459,15 @@ pub struct TodoItem {
     pub confidence_history: Vec<ConfidenceState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+    /// Existing background task IDs in this session. Dependencies block only
+    /// while running, never after completion (including failure/cancellation).
+    /// An empty array or null clears dependencies.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_waiting_on",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub waiting_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_to: Option<String>,
     /// Optional execution stage. Stages run in order: stage 2 starts only
@@ -469,6 +479,7 @@ pub struct TodoItem {
     #[serde(
         default,
         alias = "wave",
+        alias = "phase",
         deserialize_with = "deserialize_optional_stage",
         skip_serializing_if = "Option::is_none"
     )]
@@ -479,6 +490,13 @@ pub struct TodoItem {
     /// starve workers of context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+}
+
+fn deserialize_waiting_on<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Accept `2`, `2.0`, `"2"`, `"stage 2"`, `""`, or `null` for a todo stage.
@@ -714,6 +732,37 @@ pub struct CatchupBrief {
 #[cfg(test)]
 mod semantic_state_tests {
     use super::*;
+
+    #[test]
+    fn todo_waiting_on_is_backward_compatible_and_nullable() {
+        let old =
+            serde_json::json!({"id":"a", "content":"A", "status":"pending", "priority":"high"});
+        let todo: TodoItem = serde_json::from_value(old.clone()).unwrap();
+        assert!(todo.waiting_on.is_empty());
+        assert!(
+            serde_json::to_value(&todo)
+                .unwrap()
+                .get("waiting_on")
+                .is_none()
+        );
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(["task-a"]),
+        ] {
+            let mut payload = old.clone();
+            payload["waiting_on"] = value.clone();
+            let todo: TodoItem = serde_json::from_value(payload).unwrap();
+            assert_eq!(
+                todo.waiting_on,
+                if value.is_null() {
+                    vec![]
+                } else {
+                    serde_json::from_value::<Vec<String>>(value).unwrap()
+                }
+            );
+        }
+    }
 
     #[test]
     fn states_serialize_as_snake_case_strings() {

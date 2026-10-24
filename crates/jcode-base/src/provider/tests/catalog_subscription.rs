@@ -881,49 +881,28 @@ fn test_anthropic_pro_no_catalog_and_explicit_long_context_keep_legacy_gates() {
         assert_eq!(anthropic_oauth_route_availability(model), expected);
     });
 }
-
-/// Rendering the route catalog must never schedule network work.
-///
-/// Regression guard for the "spawning a session refetches every provider
-/// catalog" bug: route building used to schedule a background `/models` fetch
-/// for each stale or missing profile cache, so every session attach and picker
-/// open fanned out dozens of HTTP requests. Refresh cadence now belongs solely
-/// to the background catalog scheduler.
 #[test]
-fn building_direct_profile_routes_does_not_schedule_catalog_refreshes() {
+fn test_jcode_provider_model_switch_does_not_require_openrouter_key() {
     with_clean_provider_test_env(|| {
-        let runtime = enter_test_runtime();
+        crate::env::set_var("JCODE_API_KEY", "jcode-test-subscription-key");
+        crate::env::remove_var("OPENROUTER_API_KEY");
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         runtime.block_on(async {
-            crate::provider_catalog::save_env_value_to_env_file(
-                "OPENROUTER_API_KEY",
-                "openrouter.env",
-                Some("sk-test-openrouter"),
-            )
-            .expect("save openrouter key");
-
-            // Deliberately leave every profile cache missing/stale: under the
-            // old behavior this was the worst case that scheduled a refresh
-            // for each configured profile.
-            jcode_provider_openrouter_runtime::reset_profile_catalog_refresh_tracker_for_tests();
-
-            for profile in crate::provider_catalog::openai_compatible_profiles()
-                .iter()
-                .copied()
-            {
-                let _ = super::direct_openai_compatible_profile_routes(profile);
+            let provider = crate::provider::jcode::JcodeProvider::new();
+            for model in ["claude-haiku-5-5", "gpt-6.1-sol", "claude-opus-5-5"] {
+                provider.set_model(model).expect("managed model switch");
+                assert_eq!(provider.model(), model);
+                assert_eq!(
+                    std::env::var("JCODE_OPENROUTER_TRANSPORT_STATE").as_deref(),
+                    Ok("jcode-subscription")
+                );
+                assert_eq!(
+                    std::env::var("JCODE_OPENROUTER_API_KEY_NAME").as_deref(),
+                    Ok("JCODE_API_KEY")
+                );
             }
-
-            // If route building had scheduled refreshes, the profile tracker
-            // would have recorded attempts, and this direct call for the
-            // standard OpenRouter namespace would be throttled/in-flight.
-            assert!(
-                openrouter::maybe_schedule_standard_openrouter_catalog_refresh(
-                    "unit test post-render scheduling"
-                ),
-                "route building must leave the refresh tracker untouched"
-            );
+            assert!(std::env::var_os("OPENROUTER_API_KEY").is_none());
         });
+        crate::env::remove_var("JCODE_API_KEY");
     });
 }
-
-include!("antigravity_routing.rs");

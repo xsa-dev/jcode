@@ -12,7 +12,7 @@
 //! relays the TCP stream. Nothing touches the user's own `~/.ssh`.
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -24,6 +24,22 @@ const DEFAULT_API_BASE: &str = "https://api.jcode.sh/v1";
 const PROVISION_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
 
+/// A live multiplexed SSH master means the machine is awake and this client is
+/// already authorized, so the Jcode Cloud wake/authorize call can be skipped.
+pub(crate) fn master_is_live() -> bool {
+    let Ok(args) = ssh_args() else {
+        return false;
+    };
+    Command::new("ssh")
+        .args(args)
+        .args(["-O", "check", HOST])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 pub(crate) fn is_managed(host: &str) -> bool {
     host == HOST
 }
@@ -34,7 +50,7 @@ pub(crate) fn account_available() -> bool {
     crate::subscription_catalog::configured_api_key().is_some_and(|k| !k.trim().is_empty())
 }
 
-fn dir() -> Result<PathBuf> {
+pub(super) fn dir() -> Result<PathBuf> {
     Ok(crate::storage::jcode_dir()?.join("cloud"))
 }
 
@@ -79,7 +95,7 @@ pub(crate) fn ssh_args() -> Result<Vec<String>> {
             );
         }
     }
-    let exe = std::env::current_exe().context("locate the jcode binary")?;
+    let exe = proxy_executable(std::env::current_exe().context("locate the jcode binary")?);
     let namespace = account()
         .ok()
         .and_then(|account| control_namespace(&account.key, &account.base));
@@ -89,6 +105,27 @@ pub(crate) fn ssh_args() -> Result<Vec<String>> {
         write_private(&path, &config)?;
     }
     Ok(vec!["-F".into(), path.to_string_lossy().into_owned()])
+}
+
+/// Pick the binary SSH runs as `ProxyCommand`. A long-lived daemon whose
+/// binary was replaced by an update reports `/path/jcode (deleted)` (or a path
+/// that no longer exists). Writing that into the config would break every
+/// later cloud connection, so fall back to the stable launcher.
+pub(super) fn proxy_executable(exe: PathBuf) -> PathBuf {
+    let text = exe.to_string_lossy();
+    let stale = text.ends_with(" (deleted)") || !exe.is_file();
+    if !stale {
+        return exe;
+    }
+    let trimmed = PathBuf::from(text.trim_end_matches(" (deleted)"));
+    if trimmed.is_file() {
+        return trimmed;
+    }
+    let launcher = dirs::home_dir().map(|h| h.join(".local/bin/jcode"));
+    match launcher {
+        Some(launcher) if launcher.is_file() => launcher,
+        _ => trimmed,
+    }
 }
 
 fn control_namespace(key: &str, base: &str) -> Option<String> {
@@ -150,7 +187,7 @@ fn managed_ssh_config(
     )
 }
 
-fn ssh_quote(value: &str) -> String {
+pub(super) fn ssh_quote(value: &str) -> String {
     if value
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b"/._-+@:".contains(&b))
@@ -165,7 +202,7 @@ fn ssh_quote(value: &str) -> String {
 // Control-plane API
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub(crate) struct Reply {
     #[serde(default)]
     pub state: String,
@@ -183,7 +220,7 @@ pub(crate) struct Reply {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub(crate) struct Usage {
     #[serde(default)]
     pub used_seconds: u64,
@@ -226,6 +263,14 @@ fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
 }
 
 fn request(method: &str, path: &str, body: Option<serde_json::Value>) -> Result<Reply> {
+    request_json(method, path, body)
+}
+
+pub(super) fn request_json<T: serde::de::DeserializeOwned + Send>(
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<T> {
     let account = account()?;
     let url = format!("{}/{}", account.base, path);
     off_runtime(move || {
@@ -235,13 +280,17 @@ fn request(method: &str, path: &str, body: Option<serde_json::Value>) -> Result<
             .build()?;
         let mut req = match method {
             "POST" => client.post(&url),
-            _ => client.get(&url),
+            "GET" => client.get(&url),
+            "DELETE" => client.delete(&url),
+            _ => bail!("unsupported cloud request method"),
         }
         .bearer_auth(&account.key);
         if let Some(body) = body {
             req = req.json(&body);
         }
-        let response = req.send().context("could not reach Jcode Cloud")?;
+        let response = req
+            .send()
+            .context("could not reach Jcode Cloud (check your network or DNS connection)")?;
         let status = response.status();
         let text = response.text()?;
         if status.is_success() {
@@ -339,14 +388,18 @@ fn validated_host_keys(reply: &Reply) -> Result<Vec<String>> {
 /// go to stderr only, since stdout is the SSH wire.
 pub(crate) fn run_proxy() -> Result<()> {
     let reply = connect(&mut |message| eprintln!("[jcode cloud] {message}"))?;
+    relay_proxy(&reply, HOST, &known_hosts_path()?)
+}
+
+pub(super) fn relay_proxy(reply: &Reply, host: &str, known_hosts: &std::path::Path) -> Result<()> {
     let address: std::net::IpAddr = reply
         .address
         .as_deref()
         .and_then(|a| a.parse().ok())
         .context("Jcode Cloud returned an invalid host address")?;
-    let keys = validated_host_keys(&reply)?;
-    let known: String = keys.iter().map(|k| format!("{HOST} {k}\n")).collect();
-    write_private(&known_hosts_path()?, &known)?;
+    let keys = validated_host_keys(reply)?;
+    let known: String = keys.iter().map(|k| format!("{host} {k}\n")).collect();
+    write_private(known_hosts, &known)?;
     let addr = std::net::SocketAddr::new(address, reply.port.unwrap_or(22));
     let stream =
         off_runtime(|| std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(20)))
@@ -470,11 +523,24 @@ backend={backend}
 root="$HOME/.local/share/jcode/cloud-releases"
 mkdir -p "$HOME/.local/bin" "$root"
 # Serialize cooperating preflights without terminating any running process.
+# Wait briefly for a concurrent prepare instead of failing the move, and
+# reclaim a lock left behind by a prepare that was killed mid-run.
 lock="$root/.prepare-lock"
-if ! mkdir "$lock" 2>/dev/null; then
-  echo '[cloud prepare] another upgrade is running; retry after it finishes' >&2
-  exit 1
-fi
+waited=0
+until mkdir "$lock" 2>/dev/null; do
+  if [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+    echo '[cloud prepare] reclaiming a stale upgrade lock' >&2
+    rmdir "$lock" 2>/dev/null || rm -rf "$lock"
+    continue
+  fi
+  if [ "$waited" -ge 120 ]; then
+    echo '[cloud prepare] another upgrade is still running after 2 minutes; retry after it finishes' >&2
+    exit 1
+  fi
+  [ "$waited" -eq 0 ] && echo '[cloud prepare] waiting for another upgrade to finish' >&2
+  sleep 2
+  waited=$((waited + 2))
+done
 stage=
 backup=
 next=
@@ -522,6 +588,7 @@ probe() {{
 capable() {{
   probe "$1" cloud receive --help >/dev/null 2>&1 &&
     probe "$1" cloud credentials --help >/dev/null 2>&1 &&
+    probe "$1" cloud router-credentials --help >/dev/null 2>&1 &&
     probe "$1" cloud cancel-return --help >/dev/null 2>&1
 }}
 version_output() {{
@@ -638,7 +705,7 @@ pub(crate) fn describe(reply: &Reply) -> String {
     text
 }
 
-fn create_private_dir(path: &std::path::Path) -> Result<()> {
+pub(super) fn create_private_dir(path: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
     #[cfg(unix)]
     {
@@ -648,7 +715,7 @@ fn create_private_dir(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn write_private(path: &std::path::Path, contents: &str) -> Result<()> {
+pub(super) fn write_private(path: &std::path::Path, contents: &str) -> Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     {
         let mut options = std::fs::OpenOptions::new();
@@ -672,6 +739,24 @@ mod upgrade_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_executable_survives_replaced_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("jcode");
+        std::fs::write(&live, b"x").unwrap();
+        assert_eq!(proxy_executable(live.clone()), live);
+        // Updated in place: kernel reports "(deleted)" but the path has a new file.
+        let deleted = PathBuf::from(format!("{} (deleted)", live.display()));
+        assert_eq!(proxy_executable(deleted), live);
+        // Gone entirely: never return the deleted marker path.
+        let gone = PathBuf::from(format!("{} (deleted)", dir.path().join("old").display()));
+        assert!(
+            !proxy_executable(gone)
+                .to_string_lossy()
+                .ends_with("(deleted)")
+        );
+    }
 
     #[test]
     fn host_keys_reject_injection() {

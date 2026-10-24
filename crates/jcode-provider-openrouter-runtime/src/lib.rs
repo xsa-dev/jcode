@@ -953,6 +953,7 @@ impl OpenRouterProvider {
     fn model_is_openai_reasoning_family(model: &str) -> bool {
         let model = model.trim().to_ascii_lowercase();
         model.starts_with("gpt-5")
+            || model == "gpt-6.1-sol"
             || model.contains("codex")
             || model.starts_with("o1")
             || model.starts_with("o3")
@@ -1209,6 +1210,29 @@ impl OpenRouterProvider {
         } else {
             Some(merged)
         }
+    }
+
+    /// Provider-specific request fields that built-in profiles need by default.
+    /// User-supplied `JCODE_OPENAI_EXTRA_BODY` values win.
+    fn with_profile_default_extra_body(
+        profile_id: Option<&str>,
+        extra: Option<serde_json::Map<String, Value>>,
+    ) -> Option<serde_json::Map<String, Value>> {
+        if profile_id != Some("venice") {
+            return extra;
+        }
+        // Venice prepends its own system prompt unless told not to, which
+        // would compete with jcode's agent instructions.
+        let mut merged = extra.unwrap_or_default();
+        let params = merged
+            .entry("venice_parameters")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(params) = params.as_object_mut() {
+            params
+                .entry("include_venice_system_prompt")
+                .or_insert(Value::Bool(false));
+        }
+        Some(merged)
     }
 
     pub fn supports_provider_routing_features(&self) -> bool {
@@ -1665,7 +1689,10 @@ impl OpenRouterProvider {
             ProviderRouting::default()
         };
         let max_tokens = Self::configured_max_tokens(profile_id.as_deref());
-        let extra_body = Self::resolve_extra_body(None, &configured_env_file_name());
+        let extra_body = Self::with_profile_default_extra_body(
+            profile_id.as_deref(),
+            Self::resolve_extra_body(None, &configured_env_file_name()),
+        );
         jcode_base::logging::info(&format!(
             "[TIMING] openrouter_new: pre_struct={}ms",
             new_start.elapsed().as_millis()
@@ -2513,7 +2540,9 @@ impl OpenRouterProvider {
 
     /// Get API key from environment or config file
     fn get_api_key() -> Option<String> {
-        jcode_base::provider::openrouter::get_api_key()
+        let key_name = configured_api_key_name();
+        let env_file = configured_env_file_name();
+        jcode_base::provider_catalog::load_runtime_api_key(&key_name, &env_file)
     }
 
     /// Replace the stale built-in placeholder (`DEFAULT_MODEL`) with the newest
