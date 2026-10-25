@@ -1175,7 +1175,14 @@ fn insert_input_text_with_undo(app: &mut App, text: &str, typed: bool) {
     let within_osc_burst = app
         .osc_color_reply_scrubbed_at
         .is_some_and(|at| at.elapsed() < Duration::from_millis(500));
-    if (app.osc_color_reply_just_scrubbed || within_osc_burst) && text == "\\" {
+    if app.osc_color_reply_just_scrubbed
+        && text == "\\"
+        && !app
+            .input
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_hexdigit)
+    {
         app.osc_color_reply_just_scrubbed = false;
         app.osc_color_reply_scrubbed_at = Some(Instant::now());
         return;

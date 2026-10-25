@@ -109,11 +109,15 @@ fn strips_late_osc_color_replies() {
         "gb:d7d7/afaf/8787\\",
         "4;215;rgb:d7d7/afaf/8787\\",
         "11;rgb:0000/0000/0000\\10;rgb:e6e6/eded/f3f3\\",
+        "gb:d7d7/afaf/8787\\4;215;rgb:d7d7/afaf/8787\\00\\87\\",
     ] {
         let mut buf = String::from("hello ");
         let mut just_scrubbed = false;
         for ch in stream.chars() {
-            if just_scrubbed && ch == '\\' {
+            if just_scrubbed
+                && ch == '\\'
+                && !buf.as_bytes().last().is_some_and(u8::is_ascii_hexdigit)
+            {
                 just_scrubbed = false;
                 continue;
             }
