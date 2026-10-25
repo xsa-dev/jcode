@@ -923,7 +923,9 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         }
         // Without a leading `1N;` or `4;<idx>;` prefix, require either an
         // explicit `\` terminator or 16-bit duplicated-byte hex components so
-        // ordinary text like `rgb:3030/3434/4646` (with no `\`) is preserved.
+        // ordinary text like `rgb:3030/3434/4646` or `111;rgb:30/34/46` (with
+        // no `\`) is preserved.
+        let color_start = pos;
         pos += width;
         let mut components = 1;
         while components < wanted && bytes.get(pos) == Some(&b'/') && hex_run(pos + 1) >= width {
@@ -933,7 +935,12 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         if components < wanted {
             continue;
         }
-        if !has_osc_num && bytes.get(pos) != Some(&b'\\') {
+        let is_plain_rgb = start == gb_pos.saturating_sub(1) && bytes.get(start) == Some(&b'r');
+        let has_repeated_16bit = width == 4
+            && bytes[color_start..pos]
+                .split(|&b| b == b'/')
+                .all(|comp| comp.len() == 4 && comp[..2] == comp[2..]);
+        if !has_osc_num && bytes.get(pos) != Some(&b'\\') && (is_plain_rgb || !has_repeated_16bit) {
             continue;
         }
         if start > 0 && bytes[start - 1] == b']' {
@@ -946,11 +953,12 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         search = pos;
     }
 
-    // Remove bare `gb:` headers whose leading `r` was eaten as Alt+r (unlike
-    // `rgb:`, a bare `gb:` is never a valid color prefix on its own), plus any
-    // trailing `\` string terminator. When `gb:` is stripped first during
-    // key-by-key arrival of `gb:d7d7/afaf/8787\`, the remaining
-    // `d7d7/afaf/8787\` is subsequently caught by `tail_len` (`first_width = 4`).
+    // Remove bare `gb:` headers whose leading `r` was eaten as Alt+r and whose
+    // color components were already stripped by an earlier key event, plus any
+    // trailing `\` string terminator. Do not strip `gb:` when it is at the end
+    // of the buffer without a `\`: if `gb:d7d7/afaf/8787` is arriving character
+    // by character, `gb:` must stay until its color components arrive so the
+    // whole reply is scrubbed together even when `ESC \` is eaten as Alt+\.
     let mut header_search = 0usize;
     while let Some(found) = input[header_search..].find("gb:") {
         let gb_pos = header_search + found;
@@ -962,10 +970,14 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         {
             continue;
         }
-        if bytes.get(end) == Some(&b'\\') {
+        let has_backslash = bytes.get(end) == Some(&b'\\');
+        if has_backslash {
             end += 1;
         }
-        if end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+        if !has_backslash && (end == bytes.len() || !bytes[end].is_ascii_whitespace()) {
+            continue;
+        }
+        if has_backslash && end < bytes.len() && !bytes[end].is_ascii_whitespace() {
             continue;
         }
         if gb_pos > 0 && bytes[gb_pos - 1].is_ascii_alphanumeric() {
@@ -994,8 +1006,13 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         {
             return Some(3);
         }
-        if tail.len() >= 6 && tail[0] == b'/' && repeated_byte(&tail[1..5]) && tail[5] == b'\\' {
-            return Some(6);
+        if tail.len() >= 5 && tail[0] == b'/' && repeated_byte(&tail[1..5]) {
+            if tail.get(5) == Some(&b'\\') {
+                return Some(6);
+            }
+            if tail.len() == 5 {
+                return Some(5);
+            }
         }
         for first_width in [4, 2] {
             let end = first_width + 11;
@@ -1019,6 +1036,13 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         let Some(len) = len else {
             continue;
         };
+        if len == 5
+            && start > 0
+            && bytes[start - 1].is_ascii_alphanumeric()
+            && !ranges.iter().any(|&(_, range_end)| range_end == start)
+        {
+            continue;
+        }
         if len == 3
             && start > 0
             && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'/')

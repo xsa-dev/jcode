@@ -95,10 +95,9 @@ fn strips_late_osc_color_replies() {
     assert_eq!(strip(";215;rgb:d7d7/afaf/8787\\").as_deref(), Some(""));
     assert_eq!(strip("215;rgb:d7d7/afaf/8787\\").as_deref(), Some(""));
     assert_eq!(strip("gb:00\\87\\").as_deref(), Some(""));
-    assert_eq!(strip("gb:").as_deref(), Some(""));
-    assert_eq!(strip("draft gb:").as_deref(), Some("draft "));
     assert_eq!(strip("gb:\\").as_deref(), Some(""));
     assert_eq!(strip("draft gb:\\").as_deref(), Some("draft "));
+    assert_eq!(strip("gb: ").as_deref(), Some(" "));
     assert_eq!(
         strip("draft gb:d7/afaf/afaf\\/8787\\00\\87\\").as_deref(),
         Some("draft ")
