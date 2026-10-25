@@ -91,11 +91,44 @@ fn strips_late_osc_color_replies() {
     assert_eq!(strip("rgb:d7d7/afaf/afaf\\").as_deref(), Some(""));
     assert_eq!(strip(";rgb:d7d7/afaf/afaf\\").as_deref(), Some(""));
     assert_eq!(strip("1;rgb:d7d7/afaf/afaf\\").as_deref(), Some(""));
+    assert_eq!(strip("4;215;rgb:d7d7/afaf/8787\\").as_deref(), Some(""));
+    assert_eq!(strip(";215;rgb:d7d7/afaf/8787\\").as_deref(), Some(""));
+    assert_eq!(strip("215;rgb:d7d7/afaf/8787\\").as_deref(), Some(""));
     assert_eq!(strip("gb:00\\87\\").as_deref(), Some(""));
+    assert_eq!(strip("gb:").as_deref(), Some(""));
+    assert_eq!(strip("draft gb:").as_deref(), Some("draft "));
+    assert_eq!(strip("gb:\\").as_deref(), Some(""));
+    assert_eq!(strip("draft gb:\\").as_deref(), Some("draft "));
     assert_eq!(
         strip("draft gb:d7/afaf/afaf\\/8787\\00\\87\\").as_deref(),
         Some("draft ")
     );
+
+    // Simulate key-by-key arrival of OSC 4/11 replies where `ESC ] ... r` was
+    // eaten as Alt+r and only `gb:d7d7/afaf/8787\` arrives character by character.
+    for stream in [
+        "gb:d7d7/afaf/8787\\",
+        "4;215;rgb:d7d7/afaf/8787\\",
+        "11;rgb:0000/0000/0000\\10;rgb:e6e6/eded/f3f3\\",
+    ] {
+        let mut buf = String::from("hello ");
+        let mut just_scrubbed = false;
+        for ch in stream.chars() {
+            if just_scrubbed && ch == '\\' {
+                just_scrubbed = false;
+                continue;
+            }
+            just_scrubbed = false;
+            buf.push(ch);
+            if buf.contains("rgb") || buf.contains("gb:") || buf.contains('\\') {
+                if let Some((cleaned, _)) = strip_osc_color_replies(&buf, buf.len()) {
+                    buf = cleaned;
+                    just_scrubbed = true;
+                }
+            }
+        }
+        assert_eq!(buf, "hello ", "stream {stream:?} left remnant in {buf:?}");
+    }
 
     // Half-arrived replies are left alone until the last component is
     // complete, so no tail is stranded.

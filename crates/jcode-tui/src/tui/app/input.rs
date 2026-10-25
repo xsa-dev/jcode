@@ -805,6 +805,8 @@ fn scrub_osc_color_replies(app: &mut App) {
     };
     app.input = cleaned;
     app.cursor_pos = cursor;
+    app.osc_color_reply_just_scrubbed = true;
+    app.osc_color_reply_scrubbed_at = Some(Instant::now());
 }
 
 /// Strip complete OSC color reply bodies from `input`, returning the cleaned
@@ -839,16 +841,48 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         }
         pos += 1;
 
-        // Recognize full `1N;rgb:` headers as well as torn headers (`N;rgb:`,
-        // `;rgb:`, `rgb:`, `gb:`) where an earlier read or Alt+r handler ate
-        // the leading bytes of the OSC 10..=19 reply.
+        // Recognize full `1N;rgb:` or `4;<idx>;rgb:` headers as well as torn
+        // headers (`;N;rgb:`, `N;rgb:`, `;rgb:`, `rgb:`, `gb:`) where an
+        // earlier read or Alt+r handler ate the leading bytes of an OSC
+        // 4/10..=19 color reply.
         let mut has_osc_num = false;
         let mut start = gb_pos;
         if start > 0 && bytes[start - 1] == b'r' {
             start -= 1;
             if start > 0 && bytes[start - 1] == b';' {
-                if start >= 3 && bytes[start - 3] == b'1' && bytes[start - 2].is_ascii_digit() {
-                    let candidate_start = start - 3;
+                let semi_pos = start - 1;
+                let digit_len = bytes[..semi_pos]
+                    .iter()
+                    .rev()
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .count();
+                if (1..=3).contains(&digit_len) {
+                    let mut num_start = semi_pos - digit_len;
+                    let mut eff_digit_len = digit_len;
+                    // If a previous reply ended right inside this digit run
+                    // (e.g. `f4f411;rgb:...`), only consume the digits after
+                    // the previous reply's end.
+                    if let Some(&(_, last_end)) = ranges.last()
+                        && last_end > num_start
+                        && last_end < semi_pos
+                    {
+                        num_start = last_end;
+                        eff_digit_len = semi_pos - num_start;
+                    }
+                    // Optional `4;` or `;` before the palette index (`4;215;rgb:` or `;215;rgb:`).
+                    let mut candidate_start = num_start;
+                    if candidate_start >= 2
+                        && bytes[candidate_start - 1] == b';'
+                        && bytes[candidate_start - 2] == b'4'
+                    {
+                        candidate_start -= 2;
+                        has_osc_num = true;
+                    } else if candidate_start >= 1 && bytes[candidate_start - 1] == b';' {
+                        candidate_start -= 1;
+                        has_osc_num = true;
+                    } else if eff_digit_len == 2 && bytes[num_start] == b'1' {
+                        has_osc_num = true;
+                    }
                     let follows_reply =
                         ranges.last().is_some_and(|&(_, end)| end == candidate_start);
                     if candidate_start > 0
@@ -857,15 +891,16 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
                     {
                         continue;
                     }
+                    if !has_osc_num
+                        && candidate_start > 0
+                        && bytes[candidate_start - 1].is_ascii_alphanumeric()
+                        && !follows_reply
+                    {
+                        continue;
+                    }
                     start = candidate_start;
-                    has_osc_num = true;
-                } else if start >= 2
-                    && bytes[start - 2].is_ascii_digit()
-                    && (start == 2 || !bytes[start - 3].is_ascii_digit())
-                {
-                    start -= 2;
-                } else if start == 1 || !bytes[start - 2].is_ascii_alphanumeric() {
-                    start -= 1;
+                } else if semi_pos == 0 || !bytes[semi_pos - 1].is_ascii_alphanumeric() {
+                    start = semi_pos;
                 } else {
                     continue;
                 }
@@ -886,9 +921,9 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         if !(1..=4).contains(&width) {
             continue;
         }
-        // Without a leading `1N;` prefix, require either an explicit `\`
-        // terminator or 16-bit duplicated-byte hex components so ordinary text
-        // like `rgb:3030/3434/4646` (with no `\`) is preserved.
+        // Without a leading `1N;` or `4;<idx>;` prefix, require either an
+        // explicit `\` terminator or 16-bit duplicated-byte hex components so
+        // ordinary text like `rgb:3030/3434/4646` (with no `\`) is preserved.
         pos += width;
         let mut components = 1;
         while components < wanted && bytes.get(pos) == Some(&b'/') && hex_run(pos + 1) >= width {
@@ -909,6 +944,34 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
         }
         ranges.push((start, pos));
         search = pos;
+    }
+
+    // Remove bare `gb:` headers whose leading `r` was eaten as Alt+r (unlike
+    // `rgb:`, a bare `gb:` is never a valid color prefix on its own), plus any
+    // trailing `\` string terminator. When `gb:` is stripped first during
+    // key-by-key arrival of `gb:d7d7/afaf/8787\`, the remaining
+    // `d7d7/afaf/8787\` is subsequently caught by `tail_len` (`first_width = 4`).
+    let mut header_search = 0usize;
+    while let Some(found) = input[header_search..].find("gb:") {
+        let gb_pos = header_search + found;
+        let mut end = gb_pos + 3;
+        header_search = end;
+        if ranges
+            .iter()
+            .any(|&(range_start, range_end)| gb_pos < range_end && end > range_start)
+        {
+            continue;
+        }
+        if bytes.get(end) == Some(&b'\\') {
+            end += 1;
+        }
+        if end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+            continue;
+        }
+        if gb_pos > 0 && bytes[gb_pos - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        ranges.push((gb_pos, end));
     }
 
     // A fragmented key stream can make a prefix look complete before all of a
@@ -977,13 +1040,21 @@ pub(super) fn strip_osc_color_replies(input: &str, cursor: usize) -> Option<(Str
                 actual_start -= 1;
                 if actual_start > 0 && bytes[actual_start - 1] == b';' {
                     actual_start -= 1;
-                    if actual_start >= 2
-                        && bytes[actual_start - 2] == b'1'
-                        && bytes[actual_start - 1].is_ascii_digit()
-                    {
-                        actual_start -= 2;
-                    } else if actual_start >= 1 && bytes[actual_start - 1].is_ascii_digit() {
-                        actual_start -= 1;
+                    let digit_len = bytes[..actual_start]
+                        .iter()
+                        .rev()
+                        .take_while(|byte| byte.is_ascii_digit())
+                        .count();
+                    if (1..=3).contains(&digit_len) {
+                        actual_start -= digit_len;
+                        if actual_start >= 2
+                            && bytes[actual_start - 1] == b';'
+                            && bytes[actual_start - 2] == b'4'
+                        {
+                            actual_start -= 2;
+                        } else if actual_start >= 1 && bytes[actual_start - 1] == b';' {
+                            actual_start -= 1;
+                        }
                     }
                 }
             }
@@ -1077,9 +1148,31 @@ fn insert_input_text_with_undo(app: &mut App, text: &str, typed: bool) {
         app.cursor_pos = app.input.len();
     }
 
+    let within_osc_burst = app
+        .osc_color_reply_scrubbed_at
+        .is_some_and(|at| at.elapsed() < Duration::from_millis(500));
+    if (app.osc_color_reply_just_scrubbed || within_osc_burst) && text == "\\" {
+        app.osc_color_reply_just_scrubbed = false;
+        app.osc_color_reply_scrubbed_at = Some(Instant::now());
+        return;
+    }
+    app.osc_color_reply_just_scrubbed = false;
+
     app.input.insert_str(app.cursor_pos, text);
     app.cursor_pos += text.len();
     scrub_osc_color_replies(app);
+    // When an OSC reply burst was just scrubbed and a subsequent reply in the
+    // burst was split after `d7` (so `d7/afaf/8787\` was stripped as a tail,
+    // stranding its `gb:` header right before it), clean up the stranded `gb:`.
+    if within_osc_burst && app.input.ends_with("gb:") {
+        let len = app.input.len();
+        if len == 3 || !app.input.as_bytes()[len - 4].is_ascii_alphanumeric() {
+            app.input.truncate(len - 3);
+            app.cursor_pos = app.cursor_pos.min(app.input.len());
+            app.osc_color_reply_just_scrubbed = true;
+            app.osc_color_reply_scrubbed_at = Some(Instant::now());
+        }
+    }
 
     // Typing the final command character immediately arms picker filtering.
     // Without this, users can keep typing the command token or press Enter
