@@ -112,18 +112,6 @@ impl Config {
 - Enabled: {}
 - Bind address: {}:{}
 
-**Suggested Replies:**
-- Enabled: {}
-- Jev provider (`jev_provider`): {}
-- OpenGF mode (`use_open_gf`): {}
-- Max secondary suggestions: {}
-- Confidence threshold: {:.2}
-- Show confidence: {}
-- Custom prompts: {}
-- Full-auto Explorer: {}
-- 6-Lens Auto-Review: {}
-- Finish category (`enable_finish_category`): {}
-
 **Ambient:**
 - Enabled: {}
 - Provider: {}
@@ -323,16 +311,6 @@ impl Config {
             self.gateway.enabled,
             self.gateway.bind_addr,
             self.gateway.port,
-            self.suggested_replies.enabled,
-            self.suggested_replies.jev_provider,
-            self.suggested_replies.use_open_gf,
-            self.suggested_replies.clamped_max_secondary(),
-            self.suggested_replies.clamped_confidence_threshold(),
-            self.suggested_replies.show_confidence,
-            self.suggested_replies.sanitized_custom_prompts().len(),
-            self.suggested_replies.enable_full_auto_explorer,
-            self.suggested_replies.six_lens_auto_review,
-            self.suggested_replies.enable_finish_category,
             self.ambient.enabled,
             self.ambient.provider.as_deref().unwrap_or("(auto)"),
             self.ambient
@@ -398,5 +376,31 @@ impl Config {
                 "disabled"
             },
         )
+    }
+}
+
+impl Config {
+    /// Keyboards the companion watches for global push-to-talk.
+    ///
+    /// `[dictation] global_devices` wins. When it is empty, the keyboards
+    /// already chosen in Jcode Desktop (`[desktop.voice] global_devices`) are
+    /// used, so push-to-talk keeps working while Desktop is closed.
+    pub fn global_voice_devices(&self) -> Vec<std::path::PathBuf> {
+        if !self.dictation.global_devices.is_empty() {
+            return self.dictation.global_devices.clone();
+        }
+        self.desktop
+            .as_ref()
+            .and_then(|desktop| desktop.get("voice"))
+            .and_then(|voice| voice.get("global_devices"))
+            .and_then(|devices| devices.as_array())
+            // Missing legacy desktop devices means there are no configured
+            // devices, not a configuration read or parse failure.
+            .into_iter()
+            .flatten()
+            .filter_map(|device| device.as_str())
+            .filter(|device| !device.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .collect()
     }
 }

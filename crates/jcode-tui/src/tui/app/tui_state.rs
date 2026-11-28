@@ -1,8 +1,39 @@
 use super::*;
+#[path = "tui_state_widget_usage.rs"]
+mod widget_usage;
+
 use crate::tui::TuiState as _;
 use std::cell::RefCell;
 use std::sync::Mutex;
 use std::time::Duration;
+
+const CONTEXT_SNAPSHOT_TTL: Duration = Duration::from_millis(250);
+
+/// Remote transcript and prompt inputs are versioned by server-event handling.
+/// Expiring an unchanged remote snapshot only rescans the same history and
+/// serializes every tool input again. Local state retains the short TTL since
+/// provider/compaction inputs can change outside display-message revisions.
+fn reusable_context_snapshot<'a>(
+    app: &App,
+    age: Duration,
+    cached: &'a CachedContextSnapshot,
+    session_key: &str,
+    message_count: usize,
+    compaction: (usize, usize, bool),
+) -> Option<&'a crate::tui::ContextSnapshot> {
+    ((app.is_remote || age < CONTEXT_SNAPSHOT_TTL)
+        && cached.session_key == session_key
+        && cached.is_remote == app.is_remote
+        && cached.display_messages_version == app.display_messages_version
+        && cached.context_revision == app.context_revision
+        && cached.message_count == message_count
+        && (
+            cached.compaction_count,
+            cached.compaction_summary_chars,
+            cached.is_compacting,
+        ) == compaction)
+        .then_some(&cached.snapshot)
+}
 
 const REMOTE_STARTUP_HEADER_DEBOUNCE: Duration = Duration::from_millis(400);
 
@@ -187,20 +218,68 @@ impl App {
         (provider, model)
     }
 
+    /// Available reasoning efforts for the active remote provider/model.
+    ///
+    /// For Antigravity, uses the live remote catalog routes when available so
+    /// newly discovered models expose their exact sibling effort tiers, falling
+    /// back to static inference during the pre-catalog bootstrap window.
+    pub(super) fn remote_available_efforts(&self) -> Vec<&'static str> {
+        let (provider_name, provider_model) = self.remote_effort_identity();
+        if provider_name
+            .as_deref()
+            .is_some_and(|p| p.to_ascii_lowercase().contains("antigravity"))
+            && let Some(model) = provider_model.as_deref()
+            && !model.trim().is_empty()
+            && !model.trim().eq_ignore_ascii_case("default")
+        {
+            let catalog_models: Vec<&str> = self
+                .remote_model_options
+                .iter()
+                .filter(|route| {
+                    route.available && route.provider.eq_ignore_ascii_case("antigravity")
+                })
+                .map(|route| route.model.as_str())
+                .collect();
+            if !catalog_models.is_empty() {
+                return jcode_provider_core::antigravity_efforts_from_catalog(
+                    model,
+                    catalog_models,
+                );
+            }
+        }
+        inferred_reasoning_efforts(provider_name.as_deref(), provider_model.as_deref())
+    }
+
     /// Best-known current reasoning effort for the remote session. Falls back
     /// to the configured provider-family default when the server has not
     /// reported one yet, so pre-settle effort cycling starts from the value the
     /// session will actually use instead of assuming the maximum.
     pub(super) fn remote_reasoning_effort_hint(&self) -> Option<String> {
         if crate::tui::is_ssh_remote() {
-            return self.remote_reasoning_effort.clone();
+            return self.remote_reasoning_effort.clone().or_else(|| {
+                let (provider, model) = self.remote_effort_identity();
+                if provider
+                    .as_deref()
+                    .is_some_and(|p| p.to_ascii_lowercase().contains("antigravity"))
+                {
+                    model.as_deref().and_then(|m| {
+                        jcode_provider_core::split_antigravity_model_effort(m)
+                            .map(|(_, effort)| effort.to_string())
+                    })
+                } else {
+                    None
+                }
+            });
         }
         self.remote_reasoning_effort.clone().or_else(|| {
             let (provider, model) = self.remote_effort_identity();
             let provider = provider.unwrap_or_default().to_ascii_lowercase();
             let model = model.unwrap_or_default().to_ascii_lowercase();
             let cfg = &crate::config::config().provider;
-            if provider.contains("anthropic")
+            if provider.contains("antigravity") {
+                jcode_provider_core::split_antigravity_model_effort(&model)
+                    .map(|(_, effort)| effort.to_string())
+            } else if provider.contains("anthropic")
                 || provider.contains("claude")
                 || model.starts_with("claude-")
             {
@@ -516,229 +595,6 @@ impl App {
         }
         Some(info)
     }
-
-    fn widget_usage_info_inner(
-        &self,
-        route: WidgetRouteInfo,
-        auth_method: crate::tui::info_widget::AuthMethod,
-    ) -> Option<crate::tui::info_widget::UsageInfo> {
-        let output_tps = if matches!(self.status, ProcessingStatus::Streaming) {
-            self.compute_streaming_tps()
-        } else {
-            None
-        };
-
-        // On a resumed session, `token_accounting.total_*` is reset to 0 and the
-        // prior usage lives in `remote_total_tokens` (restored from history). Add
-        // them so the widget's "in + out" reflects the whole session, mirroring
-        // the `/cache` stats path, rather than only tokens seen since resume.
-        let (display_input_tokens, display_output_tokens) =
-            if let Some((hist_in, hist_out)) = self.remote_total_tokens {
-                (
-                    hist_in.saturating_add(self.token_accounting.total_input_tokens),
-                    hist_out.saturating_add(self.token_accounting.total_output_tokens),
-                )
-            } else {
-                (
-                    self.token_accounting.total_input_tokens,
-                    self.token_accounting.total_output_tokens,
-                )
-            };
-
-        let cost_based_usage = || crate::tui::info_widget::UsageInfo {
-            provider: crate::tui::info_widget::UsageProvider::CostBased,
-            primary_limit_label: None,
-            five_hour: 0.0,
-            five_hour_resets_at: None,
-            secondary_limit_label: None,
-            seven_day: 0.0,
-            seven_day_resets_at: None,
-            spark: None,
-            spark_resets_at: None,
-            total_cost: self.cost.total_cost,
-            input_tokens: display_input_tokens,
-            output_tokens: display_output_tokens,
-            cache_read_tokens: self.streaming.streaming_cache_read_tokens,
-            cache_write_tokens: self.streaming.streaming_cache_creation_tokens,
-            output_tps,
-            limit_reached: false,
-            available: true,
-            account_hint: None,
-        };
-
-        match route.provider {
-            WidgetProviderKind::Copilot => Some(crate::tui::info_widget::UsageInfo {
-                provider: crate::tui::info_widget::UsageProvider::Copilot,
-                primary_limit_label: None,
-                five_hour: 0.0,
-                five_hour_resets_at: None,
-                secondary_limit_label: None,
-                seven_day: 0.0,
-                seven_day_resets_at: None,
-                spark: None,
-                spark_resets_at: None,
-                total_cost: 0.0,
-                input_tokens: display_input_tokens,
-                output_tokens: display_output_tokens,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                output_tps,
-                limit_reached: false,
-                available: display_input_tokens > 0 || display_output_tokens > 0,
-                account_hint: None,
-            }),
-            WidgetProviderKind::Anthropic => {
-                match auth_method {
-                    crate::tui::info_widget::AuthMethod::AnthropicApiKey => {
-                        return Some(cost_based_usage());
-                    }
-                    crate::tui::info_widget::AuthMethod::AnthropicOAuth => {}
-                    _ => return None,
-                }
-
-                if route.is_remote {
-                    // Daemon snapshots are authoritative for the bound account.
-                    // Never call get_sync here: even a cache miss can start a
-                    // local HTTP refresh with this machine's credentials.
-                    return Some(remote_oauth_widget_usage_for_route(
-                        crate::tui::info_widget::UsageProvider::Anthropic,
-                        self.session.route_api_method.as_deref(),
-                        self.remote_provider_oauth_account_label.as_deref(),
-                        false,
-                        output_tps,
-                        |label| {
-                            crate::usage::cached_account_usage_status_snapshot(
-                                crate::usage::MultiAccountProviderKind::Anthropic,
-                                label,
-                            )
-                        },
-                    ));
-                }
-
-                let usage = crate::usage::get_sync();
-                Some(crate::tui::info_widget::UsageInfo {
-                    provider: crate::tui::info_widget::UsageProvider::Anthropic,
-                    primary_limit_label: Some("5-hour".to_string()),
-                    five_hour: usage.five_hour,
-                    five_hour_resets_at: usage.five_hour_resets_at.clone(),
-                    secondary_limit_label: Some("Weekly".to_string()),
-                    seven_day: usage.seven_day,
-                    seven_day_resets_at: usage.seven_day_resets_at.clone(),
-                    spark: None,
-                    spark_resets_at: None,
-                    total_cost: 0.0,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
-                    output_tps,
-                    limit_reached: false,
-                    available: usage.last_error.is_none(),
-                    account_hint: None,
-                })
-            }
-            WidgetProviderKind::OpenAI => {
-                match auth_method {
-                    crate::tui::info_widget::AuthMethod::OpenAIApiKey => {
-                        return Some(cost_based_usage());
-                    }
-                    crate::tui::info_widget::AuthMethod::OpenAIOAuth => {}
-                    _ => return None,
-                }
-
-                if route.is_remote {
-                    // The header reads the daemon's account cache by route label.
-                    // An email lookup here would instead probe this machine's
-                    // credentials and can show a different account's windows.
-                    return Some(remote_oauth_widget_usage_for_route(
-                        crate::tui::info_widget::UsageProvider::OpenAI,
-                        self.session.route_api_method.as_deref(),
-                        self.remote_provider_oauth_account_label.as_deref(),
-                        self.usage_reset.openai_quota_rejected,
-                        output_tps,
-                        |label| {
-                            crate::usage::cached_account_usage_status_snapshot(
-                                crate::usage::MultiAccountProviderKind::OpenAI,
-                                label,
-                            )
-                        },
-                    ));
-                }
-
-                // The selected route is session-bound, unlike the global
-                // active account. Never borrow another login's quota headroom.
-                let openai_usage = self
-                    .openai_widget_account_email()
-                    .map(|email| crate::usage::get_openai_usage_for_email_sync(&email))
-                    .unwrap_or_default();
-                Some(crate::tui::info_widget::UsageInfo {
-                    provider: crate::tui::info_widget::UsageProvider::OpenAI,
-                    primary_limit_label: openai_usage
-                        .five_hour
-                        .as_ref()
-                        .map(|window| window.name.trim_end_matches(" window").to_string()),
-                    five_hour: openai_usage
-                        .five_hour
-                        .as_ref()
-                        .map(|w| w.usage_ratio)
-                        .unwrap_or(0.0),
-                    five_hour_resets_at: openai_usage
-                        .five_hour
-                        .as_ref()
-                        .and_then(|w| w.resets_at.clone()),
-                    secondary_limit_label: openai_usage
-                        .seven_day
-                        .as_ref()
-                        .map(|window| window.name.trim_end_matches(" window").to_string()),
-                    seven_day: openai_usage
-                        .seven_day
-                        .as_ref()
-                        .map(|w| w.usage_ratio)
-                        .unwrap_or(0.0),
-                    seven_day_resets_at: openai_usage
-                        .seven_day
-                        .as_ref()
-                        .and_then(|w| w.resets_at.clone()),
-                    spark: openai_usage.spark.as_ref().map(|w| w.usage_ratio),
-                    spark_resets_at: openai_usage
-                        .spark
-                        .as_ref()
-                        .and_then(|w| w.resets_at.clone()),
-                    total_cost: 0.0,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
-                    output_tps,
-                    limit_reached: openai_usage.hard_limit_reached
-                        || self.usage_reset.openai_quota_rejected,
-                    available: openai_usage.has_limits() && openai_usage.last_error.is_none(),
-                    account_hint: None,
-                })
-            }
-            WidgetProviderKind::Gemini => None,
-            WidgetProviderKind::OpenRouter => {
-                if route.is_remote {
-                    return Some(cost_based_usage());
-                }
-
-                let runtime_provider = active_runtime_provider_key();
-                let transport_state =
-                    crate::provider::openrouter::OpenRouterTransportState::from_current_env(
-                        runtime_provider.as_deref(),
-                    );
-                if transport_state.accrues_user_api_key_cost() {
-                    Some(cost_based_usage())
-                } else {
-                    None
-                }
-            }
-            WidgetProviderKind::OpenCode | WidgetProviderKind::CostBasedApiKey => {
-                Some(cost_based_usage())
-            }
-            WidgetProviderKind::Unknown => None,
-        }
-    }
 }
 
 impl crate::tui::TuiState for App {
@@ -815,6 +671,10 @@ impl crate::tui::TuiState for App {
         &self.streaming.streaming_text
     }
 
+    fn streaming_text_hash(&self) -> u64 {
+        self.streaming.text_hash()
+    }
+
     fn pinned_todos_payload(&self) -> Option<&str> {
         self.pinned_todos_payload_ref()
     }
@@ -836,6 +696,17 @@ impl crate::tui::TuiState for App {
             PendingLogin::Exchanging { .. } => {
                 Some("Login only: exchanging credentials · not sent to AI · please wait")
             }
+            PendingLogin::AutoApiKey => {
+                Some("Login only: paste any API key · not sent to AI · /cancel")
+            }
+            PendingLogin::ApiKeyChooseProvider { .. } => {
+                Some("Login only: enter provider number or name · not sent to AI · /cancel")
+            }
+            PendingLogin::ApiKeyProfile { .. }
+            | PendingLogin::CursorApiKey
+            | PendingLogin::AzureApiKey { .. } => {
+                Some("Login only: paste API key · not sent to AI · /cancel")
+            }
             PendingLogin::OpenAiAccount { .. }
             | PendingLogin::Gemini { .. }
             | PendingLogin::Antigravity { .. } => {
@@ -843,6 +714,18 @@ impl crate::tui::TuiState for App {
             }
             _ => Some("Login only: authentication input · not sent to AI · /cancel"),
         }
+    }
+
+    fn login_input_is_secret(&self) -> bool {
+        matches!(
+            self.pending_login.as_ref(),
+            Some(
+                PendingLogin::AutoApiKey
+                    | PendingLogin::ApiKeyProfile { .. }
+                    | PendingLogin::CursorApiKey
+                    | PendingLogin::AzureApiKey { .. }
+            )
+        )
     }
 
     fn input(&self) -> &str {
@@ -1063,6 +946,11 @@ impl crate::tui::TuiState for App {
         Some(self.app_started.elapsed())
     }
 
+    fn time_since_last_response(&self) -> Option<std::time::Duration> {
+        self.last_response_at
+            .and_then(|ts| std::time::SystemTime::now().duration_since(ts).ok())
+    }
+
     fn client_focused(&self) -> bool {
         App::client_focused(self)
     }
@@ -1077,6 +965,10 @@ impl crate::tui::TuiState for App {
 
     fn has_pending_mouse_scroll_animation(&self) -> bool {
         self.mouse_scroll_queue != 0
+    }
+
+    fn stream_reveal_pending(&self) -> bool {
+        !self.stream_buffer.is_empty()
     }
 
     fn total_session_tokens(&self) -> Option<(u64, u64)> {
@@ -1183,8 +1075,16 @@ impl crate::tui::TuiState for App {
         self.remote_client_count
     }
 
+    fn jarvis_transcript(&self) -> Option<&std::collections::VecDeque<crate::tui::JarvisCaption>> {
+        Some(self.jarvis_listener.captions())
+    }
+
     fn voice_input_status(&self) -> Option<(bool, String)> {
         self.voice_input_status_line()
+    }
+
+    fn voice_composer_preview(&self) -> Option<crate::tui::VoiceComposerPreview> {
+        self.voice_composer_preview_state()
     }
 
     fn reset_hint_visible(&self, key: &str) -> bool {
@@ -1292,11 +1192,17 @@ impl crate::tui::TuiState for App {
     }
 
     fn context_snapshot(&self) -> crate::tui::ContextSnapshot {
+        if self.is_replay {
+            return crate::tui::ContextSnapshot {
+                info: None,
+                revision: self.context_revision,
+                fresh: true,
+            };
+        }
         use crate::message::{ContentBlock, Role};
         use std::time::Instant;
 
         static CACHE: Mutex<Option<(Instant, CachedContextSnapshot)>> = Mutex::new(None);
-        const TTL: Duration = Duration::from_millis(250);
 
         let session_key = if self.is_remote {
             self.remote_session_id
@@ -1337,17 +1243,16 @@ impl crate::tui::TuiState for App {
 
         if let Ok(cache) = CACHE.lock()
             && let Some((ts, cached)) = &*cache
-            && ts.elapsed() < TTL
-            && cached.session_key == session_key
-            && cached.is_remote == self.is_remote
-            && cached.display_messages_version == self.display_messages_version
-            && cached.context_revision == self.context_revision
-            && cached.message_count == message_count
-            && cached.compaction_count == compaction_count
-            && cached.compaction_summary_chars == compaction_summary_chars
-            && cached.is_compacting == is_compacting
+            && let Some(snapshot) = reusable_context_snapshot(
+                self,
+                ts.elapsed(),
+                cached,
+                &session_key,
+                message_count,
+                (compaction_count, compaction_summary_chars, is_compacting),
+            )
         {
-            return cached.snapshot.clone();
+            return snapshot.clone();
         }
 
         let mut info = self.context_info.clone();
@@ -1550,6 +1455,9 @@ impl crate::tui::TuiState for App {
     }
 
     fn client_update_available(&self) -> bool {
+        if self.is_replay {
+            return false;
+        }
         self.has_newer_binary()
     }
 
@@ -1562,6 +1470,19 @@ impl crate::tui::TuiState for App {
     }
 
     fn info_widget_data(&self) -> crate::tui::info_widget::InfoWidgetData {
+        if self.is_replay {
+            // Replay has no historical snapshots for account quotas, repository
+            // status, cloud status, or prompt sizing. Unknown is not today's
+            // value, and cumulative token totals are not the current context.
+            return crate::tui::info_widget::InfoWidgetData {
+                model: self.session.model.clone(),
+                provider_name: self.remote_provider_name.clone(),
+                session_name: self.session.short_name.clone(),
+                working_dir: self.session.working_dir.clone(),
+                historical_context: true,
+                ..Default::default()
+            };
+        }
         let context_snapshot = self.context_snapshot();
         let context_info = if let Some(context_info) = context_snapshot.info.clone() {
             (context_info.total_chars > 0).then_some(context_info)
@@ -1964,11 +1885,18 @@ impl crate::tui::TuiState for App {
         renderer.update(&self.streaming.streaming_text)
     }
 
+    fn streaming_markdown_stable_prefix(&self) -> (u64, usize) {
+        self.streaming_md_renderer.borrow().stable_prefix()
+    }
+
     fn centered_mode(&self) -> bool {
         self.centered
     }
 
     fn auth_status(&self) -> crate::auth::AuthStatus {
+        if self.is_replay {
+            return crate::auth::AuthStatus::default();
+        }
         if crate::tui::is_ssh_remote() {
             // Host-local credentials say nothing about the remote provider.
             return crate::auth::AuthStatus::default();
@@ -1984,6 +1912,9 @@ impl crate::tui::TuiState for App {
         &self,
         provider: jcode_provider_core::ActiveProvider,
     ) -> Option<crate::auth::ActiveCredential> {
+        if self.is_replay {
+            return None;
+        }
         // Reuse the same resolution the info widget uses so the header tag and
         // the widget's auth line can never disagree.
         let route = self.widget_route_info(None);
@@ -1991,6 +1922,9 @@ impl crate::tui::TuiState for App {
     }
 
     fn startup_oauth_account_label(&self) -> Option<String> {
+        if self.is_replay {
+            return None;
+        }
         if !self.is_remote {
             if crate::tui::is_ssh_remote() {
                 return None;
@@ -2011,14 +1945,29 @@ impl crate::tui::TuiState for App {
 
     fn inline_swarm_gallery_active(&self) -> bool {
         if self.debug_force_inline_gallery {
-            return !self.inline_swarm_members().is_empty();
+            return self.has_inline_swarm_members();
         }
         self.swarm_enabled
             && matches!(
                 crate::config::config().agents.swarm_spawn_mode,
                 crate::config::SwarmSpawnMode::Inline
             )
-            && !self.inline_swarm_members().is_empty()
+            && self.has_inline_swarm_members()
+    }
+
+    fn has_inline_swarm_members(&self) -> bool {
+        if self.debug_force_inline_gallery {
+            return !self.remote_swarm_members.is_empty();
+        }
+        if !self.swarm_enabled {
+            return false;
+        }
+        let self_id = if self.is_remote {
+            self.remote_session_id.as_deref()
+        } else {
+            Some(self.session.id.as_str())
+        };
+        self_id.is_some_and(|id| has_inline_swarm_descendants(&self.remote_swarm_members, id))
     }
 
     fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
@@ -2238,6 +2187,9 @@ impl crate::tui::TuiState for App {
     }
 
     fn git_branch(&self) -> Option<String> {
+        if self.is_replay {
+            return None;
+        }
         gather_git_info().map(|info| info.branch)
     }
 
@@ -2305,16 +2257,10 @@ impl crate::tui::TuiState for App {
     }
 
     fn suggestion_prompts(&self) -> Vec<(String, String)> {
+        if self.is_replay {
+            return Vec::new();
+        }
         App::suggestion_prompts(self)
-    }
-
-    fn suggested_replies_view(
-        &self,
-    ) -> Option<crate::tui::app::suggested_replies::SuggestedRepliesView> {
-        self.build_suggested_replies_view()
-    }
-    fn explorer_countdown_active(&self) -> bool {
-        self.suggested_replies.explorer_deadline.is_some()
     }
 
     fn cache_ttl_status(&self) -> Option<crate::tui::CacheTtlInfo> {
@@ -2340,16 +2286,15 @@ impl crate::tui::TuiState for App {
     }
 }
 
-/// The three Alt+N swarm views. Repeated presses cycle in declaration order.
+/// The two Alt+N swarm views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwarmPanelView {
     Chat,
-    Controls,
     FullPage,
 }
 
 impl App {
-    /// Cycle chat → inline controls → full live swarm page → chat.
+    /// Cycle chat → full live swarm page → chat.
     pub(crate) fn cycle_swarm_panel_view(&mut self) -> SwarmPanelView {
         if !self.inline_swarm_gallery_active() {
             self.swarm_panel_focused = false;
@@ -2357,18 +2302,14 @@ impl App {
             return SwarmPanelView::Chat;
         }
 
-        let next = match (self.swarm_panel_focused, self.swarm_panel_full_page) {
-            (false, _) => SwarmPanelView::Controls,
-            (true, false) => SwarmPanelView::FullPage,
-            (true, true) => SwarmPanelView::Chat,
+        let next = if self.swarm_panel_full_page {
+            SwarmPanelView::Chat
+        } else {
+            SwarmPanelView::FullPage
         };
         match next {
             SwarmPanelView::Chat => {
                 self.swarm_panel_focused = false;
-                self.swarm_panel_full_page = false;
-            }
-            SwarmPanelView::Controls => {
-                self.swarm_panel_focused = true;
                 self.swarm_panel_full_page = false;
             }
             SwarmPanelView::FullPage => {
@@ -2474,7 +2415,7 @@ impl App {
         let mut opened = 0;
         let mut failures = Vec::new();
         for session_id in order {
-            match open_swarm_agent_window(&session_id) {
+            match open_swarm_agent_window(&session_id, crate::tui::is_ssh_remote()) {
                 Ok(true) => opened += 1,
                 Ok(false) => failures.push(format!("{session_id}: no terminal emulator found")),
                 Err(error) => failures.push(format!("{session_id}: {error}")),
@@ -2501,6 +2442,20 @@ impl App {
     /// Open the currently selected swarm agent's session in a new terminal
     /// window (pop-out), reusing the resume-in-new-terminal launcher.
     pub(crate) fn pop_out_selected_swarm_agent(&mut self) {
+        self.pop_out_selected_swarm_agent_with_launcher(|exe, session_id, cwd, context| {
+            spawn_swarm_agent_window(exe, session_id, cwd, context, crate::tui::is_ssh_remote())
+        });
+    }
+
+    fn pop_out_selected_swarm_agent_with_launcher(
+        &mut self,
+        launcher: impl FnMut(
+            &std::path::Path,
+            &str,
+            &std::path::Path,
+            &jcode_app_core::session_launch::SessionSpawnContext,
+        ) -> anyhow::Result<bool>,
+    ) {
         let members = self.inline_swarm_members();
         if members.is_empty() {
             self.set_status_notice("No swarm agents to open");
@@ -2518,7 +2473,11 @@ impl App {
             .and_then(|m| m.friendly_name.clone())
             .unwrap_or_else(|| session_id.chars().take(8).collect());
 
-        match open_swarm_agent_window(&session_id) {
+        match open_swarm_agent_window_with_launcher(
+            &session_id,
+            crate::tui::is_ssh_remote(),
+            launcher,
+        ) {
             Ok(true) => self.set_status_notice(format!("Opened {label} in a new window")),
             Ok(false) => self.set_status_notice(format!(
                 "Could not open a terminal for {label} (no emulator found)"
@@ -2528,7 +2487,26 @@ impl App {
     }
 }
 
-fn open_swarm_agent_window(session_id: &str) -> anyhow::Result<bool> {
+fn open_swarm_agent_window(session_id: &str, is_ssh_remote: bool) -> anyhow::Result<bool> {
+    open_swarm_agent_window_with_launcher(
+        session_id,
+        is_ssh_remote,
+        |exe, session_id, cwd, context| {
+            spawn_swarm_agent_window(exe, session_id, cwd, context, is_ssh_remote)
+        },
+    )
+}
+
+fn open_swarm_agent_window_with_launcher(
+    session_id: &str,
+    is_ssh_remote: bool,
+    mut launcher: impl FnMut(
+        &std::path::Path,
+        &str,
+        &std::path::Path,
+        &jcode_app_core::session_launch::SessionSpawnContext,
+    ) -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
     let exe = super::launch_client_executable();
     let cwd = crate::session::Session::load_startup_stub(session_id)
         .ok()
@@ -2536,8 +2514,81 @@ fn open_swarm_agent_window(session_id: &str) -> anyhow::Result<bool> {
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_dir())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-    let socket = std::env::var("JCODE_SOCKET").ok();
-    super::spawn_in_new_terminal(&exe, session_id, &cwd, socket.as_deref())
+    let context = swarm_popout_launch_context(is_ssh_remote, &crate::server::socket_path());
+    launcher(&exe, session_id, &cwd, &context)
+}
+
+fn spawn_swarm_agent_window(
+    exe: &std::path::Path,
+    session_id: &str,
+    cwd: &std::path::Path,
+    context: &jcode_app_core::session_launch::SessionSpawnContext,
+    is_ssh_remote: bool,
+) -> anyhow::Result<bool> {
+    spawn_swarm_agent_window_with_launchers(
+        exe,
+        session_id,
+        cwd,
+        context,
+        is_ssh_remote,
+        jcode_app_core::terminal_launch::spawn_command_in_new_terminal,
+        |exe, session_id, cwd| {
+            let socket = std::env::var("JCODE_SOCKET").ok();
+            super::spawn_in_new_terminal(exe, session_id, cwd, socket.as_deref())
+        },
+    )
+}
+
+fn swarm_agent_terminal_command(
+    exe: &std::path::Path,
+    session_id: &str,
+    context: &jcode_app_core::session_launch::SessionSpawnContext,
+) -> jcode_app_core::terminal_launch::TerminalCommand {
+    let title = jcode_app_core::session_launch::resumed_window_title(session_id);
+    let mut args = vec!["--fresh-spawn".into(), "--resume".into(), session_id.into()];
+    if let Some(socket) = context
+        .runtime_env
+        .iter()
+        .find(|(key, _)| key == "JCODE_SOCKET")
+        .map(|(_, value)| value)
+    {
+        args.extend(["--socket".into(), socket.clone()]);
+    }
+    let mut command = jcode_app_core::terminal_launch::TerminalCommand::new(exe, args)
+        .title(title)
+        .fresh_spawn()
+        .kind("resume")
+        .session_id(session_id);
+    for (key, value) in &context.extra_env {
+        command = command.spawn_env(key.clone(), value.clone());
+    }
+    if !context.runtime_env.is_empty() {
+        command = command.runtime_env(context.runtime_env.clone());
+    }
+    if !context.client_terminal_env.is_empty() {
+        command = command.client_terminal_env(context.client_terminal_env.clone());
+    }
+    command
+}
+
+fn spawn_swarm_agent_window_with_launchers(
+    exe: &std::path::Path,
+    session_id: &str,
+    cwd: &std::path::Path,
+    context: &jcode_app_core::session_launch::SessionSpawnContext,
+    is_ssh_remote: bool,
+    mut local_launcher: impl FnMut(
+        &jcode_app_core::terminal_launch::TerminalCommand,
+        &std::path::Path,
+    ) -> anyhow::Result<bool>,
+    mut ssh_launcher: impl FnMut(&std::path::Path, &str, &std::path::Path) -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
+    if is_ssh_remote {
+        ssh_launcher(exe, session_id, cwd)
+    } else {
+        let command = swarm_agent_terminal_command(exe, session_id, context);
+        local_launcher(&command, cwd)
+    }
 }
 
 /// Decode direct agent badges without capturing plain digits or other chords.
@@ -2553,6 +2604,24 @@ pub(crate) fn swarm_agent_shortcut_index(
         KeyCode::Char('0') => Some(9),
         KeyCode::Char(c @ '1'..='9') => Some((c as u8 - b'1') as usize),
         _ => None,
+    }
+}
+
+/// Runtime context for opening a swarm agent's window: local daemon clients
+/// carry their effective runtime so the new terminal connects back to the same
+/// one; SSH clients keep the historical context-free behavior.
+fn swarm_popout_launch_context(
+    is_ssh_remote: bool,
+    socket: &std::path::Path,
+) -> jcode_app_core::session_launch::SessionSpawnContext {
+    if is_ssh_remote {
+        jcode_app_core::session_launch::SessionSpawnContext::default()
+    } else {
+        jcode_app_core::session_launch::SessionSpawnContext::default()
+            .with_local_runtime(socket)
+            .with_client_terminal_env(
+                jcode_app_core::terminal_launch::snapshot_client_terminal_env(),
+            )
     }
 }
 
@@ -2662,35 +2731,24 @@ pub(crate) fn filter_inline_swarm_subtree(
         .collect()
 }
 
-impl App {
-    fn inline_swarm_members_unticked(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
-        if self.debug_force_inline_gallery {
-            return self.remote_swarm_members.clone();
-        }
-        if !self.swarm_enabled {
-            return Vec::new();
-        }
-        // Scope the inline gallery to the subtree this session actually spawned.
-        // Other sessions can share the same swarm (e.g. same repo) without this
-        // session having spawned them; showing those would be noise. The spawn
-        // tree is reconstructed from each member's `report_back_to_session_id`
-        // parent edge.
-        let self_id = if self.is_remote {
-            self.remote_session_id.as_deref()
-        } else {
-            Some(self.session.id.as_str())
-        };
-        match self_id {
-            Some(self_id) => filter_inline_swarm_subtree(&self.remote_swarm_members, self_id),
-            // Session identity is not known yet (e.g. right after connect,
-            // before the History event sets `remote_session_id`). Showing all
-            // swarm members here caused the inline strip to flash on startup
-            // and then disappear once the subtree filter kicked in. Hide the
-            // strip until we know who we are.
-            None => Vec::new(),
-        }
-    }
+/// A nonempty descendant traversal must start with a non-self direct child.
+/// Conversely that child's own record is in the result, even with duplicate
+/// IDs or cycles. No indexing, cloning, or elapsed-time updates are needed.
+fn has_inline_swarm_descendants(
+    members: &[crate::protocol::SwarmMemberStatus],
+    self_id: &str,
+) -> bool {
+    members.iter().any(|member| {
+        member.session_id != self_id && member.report_back_to_session_id.as_deref() == Some(self_id)
+    })
 }
+
+#[path = "tui_state_inline_swarm.rs"]
+mod inline_swarm;
+
+#[cfg(test)]
+#[path = "tui_state_context_cache_tests.rs"]
+mod context_cache_tests;
 
 #[cfg(test)]
 #[path = "tui_state_sidebar_usage_tests.rs"]
@@ -2701,106 +2759,5 @@ mod sidebar_usage_tests;
 mod swarm_panel_key_tests;
 
 #[cfg(test)]
-mod inline_swarm_subtree_tests {
-    use super::filter_inline_swarm_subtree;
-    use crate::protocol::SwarmMemberStatus;
-
-    fn member(id: &str, parent: Option<&str>) -> SwarmMemberStatus {
-        SwarmMemberStatus {
-            session_id: id.to_string(),
-            friendly_name: Some(id.to_string()),
-            status: "running".to_string(),
-            detail: None,
-            task_label: None,
-            role: None,
-            is_headless: Some(true),
-            live_attachments: None,
-            status_age_secs: Some(1),
-            output_tail: None,
-            report_back_to_session_id: parent.map(str::to_string),
-            todo_progress: None,
-            todo_items: Vec::new(),
-            runtime: crate::protocol::SwarmMemberRuntime::default(),
-        }
-    }
-
-    fn ids(members: Vec<SwarmMemberStatus>) -> Vec<String> {
-        let mut v: Vec<String> = members.into_iter().map(|m| m.session_id).collect();
-        v.sort();
-        v
-    }
-
-    #[test]
-    fn includes_direct_children_but_not_self() {
-        let members = vec![
-            member("me", None),
-            member("child_a", Some("me")),
-            member("child_b", Some("me")),
-            member("stranger", None),
-        ];
-        // The viewing session ("me") is excluded; only its spawned children show.
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "me")),
-            vec!["child_a", "child_b"]
-        );
-    }
-
-    #[test]
-    fn includes_transitive_descendants() {
-        let members = vec![
-            member("me", None),
-            member("child", Some("me")),
-            member("grandchild", Some("child")),
-        ];
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "me")),
-            vec!["child", "grandchild"]
-        );
-    }
-
-    #[test]
-    fn excludes_siblings_and_unrelated_sessions() {
-        // Two coordinators sharing one swarm. Each should only see its own kids.
-        let members = vec![
-            member("coord_a", None),
-            member("a_child", Some("coord_a")),
-            member("coord_b", None),
-            member("b_child", Some("coord_b")),
-        ];
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "coord_a")),
-            vec!["a_child"]
-        );
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "coord_b")),
-            vec!["b_child"]
-        );
-    }
-
-    #[test]
-    fn session_with_no_children_shows_nothing() {
-        // A session that spawned no one (even if it is itself a swarm member)
-        // produces an empty list so the strip is hidden entirely.
-        let members = vec![
-            member("me", None),
-            member("stranger", None),
-            member("other", None),
-        ];
-        assert!(filter_inline_swarm_subtree(&members, "me").is_empty());
-    }
-
-    #[test]
-    fn cycle_is_guarded() {
-        // Pathological parent cycle must not loop forever.
-        let members = vec![
-            member("a", Some("b")),
-            member("b", Some("a")),
-            member("me", None),
-            member("child", Some("me")),
-        ];
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "me")),
-            vec!["child"]
-        );
-    }
-}
+#[path = "tui_state_inline_swarm_tests.rs"]
+mod inline_swarm_subtree_tests;

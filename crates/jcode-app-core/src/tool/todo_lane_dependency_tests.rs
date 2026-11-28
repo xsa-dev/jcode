@@ -9,6 +9,26 @@ fn parsed(value: Value) -> Vec<TodoItem> {
 }
 
 #[test]
+fn cancellation_preserves_legacy_direct_prerequisite_until_explicitly_cleared() {
+    let mut stored = json!([item("a", 1, "base"), item("b", 2, "work")]);
+    stored[1]["blocked_by"] = json!(["a"]);
+    let cancel = json!([{"name":"a", "reason":"obsolete"}]);
+    assert!(
+        apply_todo_patch(json!({"cancel":cancel}), || stored.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("blocked_by")
+    );
+    let remaining = apply_todo_patch(
+        json!({"cancel":cancel,"update":[{"name":"b","blocked_by":[]}]}),
+        || stored,
+    )
+    .unwrap();
+    assert_eq!(remaining["todos"].as_array().unwrap().len(), 1);
+    assert_eq!(remaining["todos"][0]["id"], "b");
+}
+
+#[test]
 fn hierarchical_after_is_copied_to_every_member() {
     let todos = parsed(json!({"phases": [
         {"phase": 9, "lanes": [{"lane": "base", "items": [{"id": "a", "content": "A", "status": "pending", "priority": "high"}]}]},
@@ -58,7 +78,6 @@ fn incremental_edits_apply_to_whole_lane_and_new_members_inherit() {
 #[test]
 fn public_schema_exposes_lane_dependencies_only_at_correct_levels() {
     let schema = TodoTool.parameters_schema();
-    assert!(schema["properties"]["update"]["items"]["properties"]["lane_dependencies"].is_object());
     assert!(schema["properties"]["add"]["items"]["properties"]["lane_dependencies"].is_object());
     assert!(
         schema["properties"]["update"]["items"]["properties"]
@@ -135,4 +154,45 @@ fn conflicting_dependency_aliases_are_rejected() {
         || json!([]),
     );
     assert!(result.unwrap_err().to_string().contains("not both"));
+}
+
+#[test]
+fn phase_lane_owner_marks_every_member_and_update_flips_whole_lane() {
+    let todos = parsed(json!({"phases": [
+        {"phase": 1, "lanes": [
+            {"lane": "api", "owner": "worker", "items": [
+                {"id": "a", "content": "A", "status": "pending", "priority": "high"},
+                {"id": "b", "content": "B", "status": "pending", "priority": "high"}
+            ]},
+            {"lane": "mine", "items": [{"id": "c", "content": "C", "status": "pending", "priority": "high"}]}
+        ]}
+    ]}));
+    assert!(
+        todos[..2]
+            .iter()
+            .all(crate::todo::stages::lane_requests_worker)
+    );
+    assert!(!crate::todo::stages::lane_requests_worker(&todos[2]));
+
+    let stored = json!([item("a", 1, "api"), item("b", 1, "api")]);
+    let updated = apply_todo_patch(
+        json!({"update": [{"id": "b", "lane_owner": "worker"}]}),
+        || stored,
+    )
+    .unwrap();
+    let todos = parsed(updated);
+    assert!(todos.iter().all(crate::todo::stages::lane_requests_worker));
+}
+
+#[test]
+fn unknown_lane_owner_is_rejected() {
+    let mut bad = TodoItem {
+        id: "a".into(),
+        content: "A".into(),
+        status: "pending".into(),
+        priority: "high".into(),
+        ..Default::default()
+    };
+    bad.lane_owner = Some("robot".into());
+    assert!(crate::todo::stages::validate_lane_dependencies(&[bad]).is_err());
 }

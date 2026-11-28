@@ -1,6 +1,80 @@
 // Tests for the inline chat todo card (`/todos` command + todo-card hotkey).
 
 #[test]
+fn ssh_pinned_todos_arrive_before_history_and_survive_it() {
+    if super::commands_dispatch::ssh_test_runs_in_child(
+        "ssh_pinned_todos_arrive_before_history_and_survive_it",
+    ) {
+        return;
+    }
+    let _env_lock = crate::storage::lock_test_env();
+    let _render_lock = crate::tui::ui::render_state_test_lock();
+    let _pin = PinTodosEnvGuard::enable();
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = None;
+    app.resume_session_id = Some("remote-early-todos".into());
+    app.onboarding_flow = None;
+    app.onboarding_startup_checked = true;
+    crate::todo::save_todos(
+        "remote-early-todos",
+        &[pinned_band_todo(
+            "local",
+            "Unrelated local todo must not leak",
+            "pending",
+        )],
+    )
+    .unwrap();
+    app.refresh_pinned_todos_now();
+    assert!(app.pinned_todos_payload_ref().is_none());
+    let payload = serde_json::json!({
+        "todos": [pinned_band_todo("remote", "Authoritative early remote task", "pending")],
+        "plan": {}, "goals": []
+    })
+    .to_string();
+    app.receive_remote_todos("wrong-remote-session".into(), payload.clone());
+    assert!(app.remote_todos_payload.is_none());
+    let started = std::time::Instant::now();
+    app.receive_remote_todos("remote-early-todos".into(), payload);
+    assert!(
+        app.remote_session_id.is_none(),
+        "todo snapshot must not claim the connection's session"
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    let text = render_and_snap(&app, &mut terminal);
+    assert!(text.contains("Authoritative early remote task"), "{text}");
+    assert!(!text.contains("Unrelated local todo"), "{text}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    eprintln!(
+        "authoritative pre-History todo rendered in {:?}",
+        started.elapsed()
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _runtime_guard = runtime.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let history = serde_json::from_value(serde_json::json!({
+        "type": "history", "id": 1, "session_id": "remote-early-todos",
+        "messages": [], "mcp_servers": [], "skills": [], "all_sessions": []
+    }))
+    .unwrap();
+    app.handle_server_event(history, &mut remote);
+    assert!(app.remote_todos_payload.is_some());
+    assert!(
+        app.pinned_todos_payload_ref()
+            .unwrap()
+            .contains("Authoritative early remote task")
+    );
+    // An old payload must still be rejected after the session is established.
+    app.receive_remote_todos("wrong-remote-session".into(), "{}".into());
+    assert!(
+        app.pinned_todos_payload_ref()
+            .unwrap()
+            .contains("Authoritative early remote task")
+    );
+    crate::todo::save_todos("remote-early-todos", &[]).unwrap();
+}
+
+#[test]
 fn ssh_todos_command_renders_remote_card() {
     if super::commands_dispatch::ssh_test_runs_in_child("ssh_todos_command_renders_remote_card") {
         return;
@@ -164,16 +238,17 @@ fn refresh_todo_card_updates_content_when_todos_change() {
 
     let todo = |content: &str, status: &str| crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "t1".to_string(),
         content: content.to_string(),
         status: status.to_string(),
         priority: "high".to_string(),
         group: None,
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(70)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -214,38 +289,39 @@ fn refresh_todo_card_updates_content_when_goal_scores_change() {
     let session_id = app.session.id.clone();
     let todos = [crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "t1".to_string(),
         content: "render scores".to_string(),
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: None,
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(80)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
         stage: None,
         details: None,
     }];
-    let goal = |score| crate::todo::TodoGoal {
+    let goal = |state| crate::todo::TodoGoal {
         group: None,
-        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(score)),
+        closed_feedback_loop: Some(state),
         feedback_loop: Some("inspect the frame".to_string()),
-        delivery_state: Some(crate::todo::DeliveryState::from_legacy_score(90)),
+        delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
         ..Default::default()
     };
 
     let plan = crate::todo::TodoPlan {
         user_intention: Some("keep the plan state visible".to_string()),
-        understands_user_intent: Some(crate::todo::IntentUnderstanding::from_legacy_score(95)),
+        understands_user_intent: Some(crate::todo::IntentUnderstanding::Partial),
         ..Default::default()
     };
 
     crate::todo::save_todos(&session_id, &todos).unwrap();
-    crate::todo::save_goals(&session_id, &[goal(70)]).unwrap();
+    crate::todo::save_goals(&session_id, &[goal(crate::todo::FeedbackLoopState::Usable)]).unwrap();
     crate::todo::save_plan(&session_id, &plan).unwrap();
     app.toggle_todo_card();
     let card = app
@@ -259,7 +335,7 @@ fn refresh_todo_card_updates_content_when_goal_scores_change() {
             .contains("\"understands_user_intent\":\"partial\"")
     );
 
-    crate::todo::save_goals(&session_id, &[goal(95)]).unwrap();
+    crate::todo::save_goals(&session_id, &[goal(crate::todo::FeedbackLoopState::Strong)]).unwrap();
     assert!(app.refresh_todo_card_if_needed());
     let card = app
         .display_messages
@@ -277,16 +353,17 @@ fn refresh_todo_card_updates_content_when_goal_scores_change() {
 fn pinned_band_todo(id: &str, content: &str, status: &str) -> crate::todo::TodoItem {
     crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: id.to_string(),
         content: content.to_string(),
         status: status.to_string(),
         priority: "high".to_string(),
         group: None,
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(80)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -338,6 +415,113 @@ fn pinned_todos_payload_stays_empty_when_config_off() {
     assert!(app.pinned_todos_payload_ref().is_none());
 
     let _ = crate::todo::save_todos(&session_id, &[]);
+}
+
+#[test]
+fn pinned_todos_render_before_resumed_server_history() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _pin = PinTodosEnvGuard::enable();
+    let mut app = create_test_app();
+    let session_id = app.session.id.clone();
+    crate::todo::save_todos(
+        &session_id,
+        &[pinned_band_todo(
+            "resume-first-frame",
+            "Resumed pinned task",
+            "pending",
+        )],
+    )
+    .unwrap();
+    let startup_started = std::time::Instant::now();
+    let resumed = App::new_for_remote(Some(session_id.clone()));
+    assert!(
+        resumed
+            .pinned_todos_payload_ref()
+            .expect("startup constructor seeds pinned todos without server History")
+            .contains("Resumed pinned task")
+    );
+    eprintln!(
+        "resume pinned todos ready in {:?} without server History",
+        startup_started.elapsed()
+    );
+    app.is_remote = true;
+    app.remote_session_id = None;
+    app.resume_session_id = Some(session_id.clone());
+    app.onboarding_flow = None;
+    app.onboarding_startup_checked = true;
+    app.push_display_message(crate::tui::DisplayMessage::system("Resumed transcript"));
+
+    // This is the startup seed, before any server History or polling tick.
+    app.refresh_pinned_todos_now();
+    assert!(
+        app.pinned_todos_payload_ref()
+            .unwrap()
+            .contains("Resumed pinned task")
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::ui::draw(frame, &app))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("Resumed pinned task"), "{text}");
+    assert!(
+        !app.refresh_pinned_todos_if_needed(),
+        "unchanged state stays throttled"
+    );
+    crate::todo::save_todos(&session_id, &[]).unwrap();
+}
+
+#[test]
+fn pinned_todos_session_switch_bypasses_previous_snapshot_and_throttle() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _pin = PinTodosEnvGuard::enable();
+    let mut app = create_test_app();
+    let session_id = app.session.id.clone();
+    crate::todo::save_todos(
+        &session_id,
+        &[pinned_band_todo("new-task", "New session task", "pending")],
+    )
+    .unwrap();
+    app.is_remote = true;
+    app.remote_session_id = Some("previous-todo-session".into());
+    app.receive_remote_todos(
+        "previous-todo-session".into(),
+        serde_json::json!({
+            "todos": [pinned_band_todo("old-task", "Previous session task", "pending")],
+            "plan": {}, "goals": []
+        })
+        .to_string(),
+    );
+    app.remote_todos_requested_at = Some(std::time::Instant::now());
+    assert!(
+        app.pinned_todos_payload_ref()
+            .unwrap()
+            .contains("Previous session task")
+    );
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _runtime_guard = runtime.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let history = serde_json::from_value(serde_json::json!({
+        "type": "history", "id": 1, "session_id": session_id,
+        "messages": [], "mcp_servers": [], "skills": [], "all_sessions": []
+    }))
+    .unwrap();
+    app.handle_server_event(history, &mut remote);
+    assert!(app.remote_todos_payload.is_none());
+    assert!(app.remote_todos_requested_at.is_none());
+    let payload = app
+        .pinned_todos_payload_ref()
+        .expect("new session todos loaded during History");
+    assert!(payload.contains("New session task"));
+    assert!(!payload.contains("Previous session task"));
+    crate::todo::save_todos(&session_id, &[]).unwrap();
 }
 
 #[test]
@@ -874,6 +1058,7 @@ fn pinned_band_shows_stage_grid_and_live_swarm_agents_end_to_end() {
 }
 
 #[test]
+#[ignore = "obsolete since 92fc0d019 retired inline swarm controls; needs rewrite for dedicated swarm page"]
 fn pinned_todo_live_status_is_full_width_without_passive_gallery() {
     let _env_lock = crate::storage::lock_test_env();
     let _render_lock = crate::tui::ui::render_state_test_lock();
@@ -931,7 +1116,7 @@ fn debug_inject_todos_preserves_role_and_renders_fixture() {
     let _env_lock = crate::storage::lock_test_env();
     let _render_lock = crate::tui::ui::render_state_test_lock();
     let mut app = create_test_app();
-    let payload = serde_json::json!({"todos":[{"id":"debug", "content":"Authorize", "status":"pending", "priority":"high", "completely_blocked":{"reason":"Only the owner can approve"}}]});
+    let payload = serde_json::json!({"todos":[{"id":"debug", "content":"Authorize", "status":"pending", "priority":"high", "requires_user_auth":{"reason":"Only the owner can approve"}}]});
     let response = app.handle_debug_command(&format!("inject:todos:{payload}"));
     assert!(
         response.starts_with("OK: injected todos message"),
@@ -948,7 +1133,37 @@ fn debug_inject_todos_preserves_role_and_renders_fixture() {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     let text = render_and_snap(&app, &mut terminal);
     assert!(
-        text.contains("✋") && text.contains("Completely blocked"),
+        text.contains("✋") && text.contains("Needs your login"),
         "{text}"
     );
 }
+
+#[test]
+fn expanded_pinned_todo_band_scrolls_when_taller_than_budget() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _render_lock = crate::tui::ui::render_state_test_lock();
+    let _pin = PinTodosEnvGuard::enable();
+    let mut app = create_test_app();
+    app.pinned_todos_expanded = true;
+    let todos: Vec<_> = (0..40)
+        .map(|i| pinned_band_todo(&format!("t{i}"), &format!("Task number {i}"), "pending"))
+        .collect();
+    app.pinned_todos_payload = Some(serde_json::json!({ "todos": todos }).to_string());
+    crate::tui::ui::viewport::reset_pinned_todo_scroll();
+
+    let (lines, _) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
+    assert!(
+        lines.len() <= 21,
+        "expanded band is bounded: {}",
+        lines.len()
+    );
+    assert!(lines[0].to_string().contains("scroll"));
+    crate::tui::ui::viewport::publish_pinned_todo_scroll_for_test();
+    assert!(crate::tui::ui::viewport::scroll_pinned_todos(3));
+    let (scrolled, _) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
+    assert_ne!(lines[1].to_string(), scrolled[1].to_string());
+    crate::tui::ui::viewport::reset_pinned_todo_scroll();
+}
+
+#[path = "todo_card_additional_tests.rs"]
+mod additional_resumed_local_snapshot_keeps_polling_so_card_does_not_go_stale;

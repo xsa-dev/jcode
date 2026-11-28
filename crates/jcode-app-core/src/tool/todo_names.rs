@@ -2,9 +2,31 @@
 use super::*;
 
 /// Keep the existing leniency for providers that stringify tool arguments.
+/// Item fields where an explicit null is a documented "clear" instruction.
+const NULL_CLEARS: &[&str] = &[
+    "lane_dependencies",
+    "lane_after",
+    "requires_user_auth",
+    "waiting_on",
+];
+
 pub(super) fn normalize_containers(input: &mut Value) {
     *input = normalize_todo_input(std::mem::take(input));
-    for key in ["update", "add", "remove"] {
+    // A stringified `phases` (including the literal "null") is the same
+    // provider quirk `normalize_todo_input` already absorbs for `todos`.
+    if let Some(phases) = input.get_mut("phases")
+        && let Value::String(raw) = phases
+    {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            *phases = Value::Null;
+        } else if let Ok(parsed @ (Value::Array(_) | Value::Null)) =
+            serde_json::from_str::<Value>(trimmed)
+        {
+            *phases = parsed;
+        }
+    }
+    for key in ["update", "add", "remove", "cancel"] {
         let Some(value) = input.get_mut(key) else {
             continue;
         };
@@ -27,6 +49,13 @@ pub(super) fn normalize_containers(input: &mut Value) {
                 {
                     *item = parsed;
                 }
+                // Strict-schema providers send every optional field as null.
+                // Null means "omitted" except where it documents a clear.
+                if let Some(fields) = item.as_object_mut() {
+                    fields.retain(|key, value| {
+                        !value.is_null() || NULL_CLEARS.contains(&key.as_str())
+                    });
+                }
             }
         }
     }
@@ -44,7 +73,7 @@ fn task_name(todo: &Value) -> Option<&str> {
     todo.get("content").and_then(Value::as_str)
 }
 
-fn resolve_name(todos: &[Value], name: &str) -> Result<String> {
+pub(super) fn resolve_name(todos: &[Value], name: &str) -> Result<String> {
     let mut matches = todos.iter().filter(|todo| task_name(todo) == Some(name));
     let todo = matches
         .next()

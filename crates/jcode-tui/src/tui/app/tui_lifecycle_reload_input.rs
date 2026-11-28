@@ -1,6 +1,12 @@
 use super::*;
 
 impl App {
+    /// A pending reload-recovery continuation must run as its own turn before
+    /// user follow-ups queued ahead of the reload are sent.
+    pub(in crate::tui::app) fn reload_recovery_blocks_queue(&self) -> bool {
+        self.reload_recovery_dispatch_pending && !self.hidden_queued_system_messages.is_empty()
+    }
+
     pub(in crate::tui::app) fn apply_restored_reload_input(
         &mut self,
         restored: RestoredReloadInput,
@@ -69,6 +75,7 @@ impl App {
         }
 
         self.queued_messages = queued_messages;
+        self.queued_images = restored.queued_images;
         self.queued_commands = restored.queued_commands;
         if self.has_queued_followups() {
             if self.is_remote {

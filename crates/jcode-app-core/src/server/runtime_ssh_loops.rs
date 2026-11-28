@@ -1,6 +1,6 @@
-//! Server-owned remote loop control. Only sessions explicitly opted in through
-//! remote subscription or runtime_command get a state file, so ordinary local clients retain
-//! their existing client-side follow-up behavior.
+//! Daemon-owned turn-end continuation for every client. The persisted session
+//! policy owns auto-poke and workflow follow-ups, including while disconnected.
+//! Clients only control and display this state.
 use crate::{agent::Agent, protocol::ServerEvent, todo};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -11,8 +11,6 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-const MAX_CONTINUATIONS_PER_TURN: usize = 32;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Workflow {
     kind: String,
@@ -21,11 +19,17 @@ struct Workflow {
     active: bool,
 }
 
+const INTERRUPT_PAUSE_REARM_SECS: u64 = 5 * 60;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct LoopState {
     version: u32,
     poke_enabled: bool,
+    rearm_on_user_turn: bool,
+    user_prompt_since_pause: bool,
+    paused_at_unix_secs: Option<u64>,
+    paused_todo_fingerprint: Option<String>,
     workflow: Option<Workflow>,
     policy: todo::followup::FollowUpPolicy,
     turns: u64,
@@ -37,12 +41,38 @@ impl Default for LoopState {
         Self {
             version: 1,
             poke_enabled: false,
+            rearm_on_user_turn: false,
+            user_prompt_since_pause: false,
+            paused_at_unix_secs: None,
+            paused_todo_fingerprint: None,
             workflow: None,
             policy: todo::followup::FollowUpPolicy::new(false),
             turns: 0,
             last_notice: None,
         }
     }
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn todo_fingerprint(session_id: &str) -> Option<String> {
+    let todos = todo::load_todos(session_id).ok()?;
+    serde_json::to_string(&todos).ok()
+}
+
+fn rearm_state(state: &mut LoopState) {
+    state.rearm_on_user_turn = false;
+    state.user_prompt_since_pause = false;
+    state.paused_at_unix_secs = None;
+    state.paused_todo_fingerprint = None;
+    state.poke_enabled = true;
+    state.policy = todo::followup::FollowUpPolicy::new(true);
+    state.last_notice = None;
 }
 
 fn state_lock() -> &'static Mutex<()> {
@@ -77,9 +107,8 @@ fn read_state(path: &Path) -> Result<LoopState> {
     Ok(state)
 }
 
-/// Remote clients delegate automatic followups to the daemon, including while
-/// disconnected. Initialize once, never re-arm an explicit /poke off or reset
-/// persisted retry budgets when another client attaches.
+/// Initialize daemon continuation once for any session. Never re-arm an explicit
+/// /poke off or reset persisted retry budgets when another client attaches.
 pub(super) fn initialize_remote_session(session_id: &str, enabled: bool) -> Result<()> {
     let _lock = state_lock().lock().unwrap_or_else(|p| p.into_inner());
     let path = state_path(session_id)?;
@@ -93,6 +122,59 @@ pub(super) fn initialize_remote_session(session_id: &str, enabled: bool) -> Resu
     };
     crate::storage::write_json(&path, &state)?;
     Ok(())
+}
+
+/// Record that the user sent a prompt after an Escape interrupt paused
+/// auto-poke, and re-arm if the pause timeout has also elapsed (or todos
+/// changed). Never overrides an explicit `/poke off`.
+pub(super) fn rearm_on_user_turn(session_id: &str) -> Result<bool> {
+    let _lock = state_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let path = state_path(session_id)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut state = read_state(&path)?;
+    if !state.rearm_on_user_turn {
+        return Ok(false);
+    }
+    state.user_prompt_since_pause = true;
+    let current_todo_fp = todo_fingerprint(session_id);
+    let rearmed = maybe_rearm_paused_state(
+        session_id,
+        &mut state,
+        now_unix_secs(),
+        current_todo_fp.as_deref(),
+    )
+    .is_some();
+    crate::storage::write_json(&path, &state)?;
+    Ok(rearmed)
+}
+
+fn maybe_rearm_paused_state(
+    session_id: &str,
+    state: &mut LoopState,
+    now_secs: u64,
+    current_todo_fp: Option<&str>,
+) -> Option<&'static str> {
+    if !state.rearm_on_user_turn {
+        return None;
+    }
+    let elapsed_ready = state
+        .paused_at_unix_secs
+        .is_some_and(|paused_at| now_secs.saturating_sub(paused_at) >= INTERRUPT_PAUSE_REARM_SECS);
+    let todos_changed = state.paused_todo_fingerprint.as_deref() != current_todo_fp;
+    let reason = if todos_changed {
+        "todos_updated_after_interrupt"
+    } else if elapsed_ready && state.user_prompt_since_pause {
+        "pause_timeout_and_user_turn"
+    } else {
+        return None;
+    };
+    rearm_state(state);
+    crate::logging::info(&format!(
+        "AUTO_POKE_DECISION owner=daemon session={session_id} action=rearm reason={reason}"
+    ));
+    Some(reason)
 }
 
 fn update_state<T>(
@@ -144,6 +226,10 @@ pub(super) fn control(
     }
     if command == "poke" && action == "on" {
         return update_state(session_id, |state| {
+            state.rearm_on_user_turn = false;
+            state.user_prompt_since_pause = false;
+            state.paused_at_unix_secs = None;
+            state.paused_todo_fingerprint = None;
             if !state.poke_enabled {
                 state.poke_enabled = true;
                 state.policy = todo::followup::FollowUpPolicy::new(true);
@@ -151,7 +237,27 @@ pub(super) fn control(
             if let Some(workflow) = state.workflow.as_mut() {
                 workflow.active = true;
             }
-            let message = "Remote auto-poke enabled. Continuation will be checked at the next turn boundary. Use /poke to continue now.".to_string();
+            let message = "Daemon auto-poke enabled. Continuation will be checked at the next turn boundary. Use /poke to continue now.".to_string();
+            state.last_notice = Some(message.clone());
+            let data = status_data(session_id, state)?;
+            Ok(Some((data, message)))
+        });
+    }
+    if command == "poke" && action == "pause" {
+        return update_state(session_id, |state| {
+            if state.poke_enabled {
+                state.rearm_on_user_turn = true;
+                state.user_prompt_since_pause = false;
+                state.paused_at_unix_secs = Some(now_unix_secs());
+                state.paused_todo_fingerprint = todo_fingerprint(session_id);
+            }
+            state.poke_enabled = false;
+            if let Some(workflow) = state.workflow.as_mut() {
+                workflow.active = false;
+            }
+            state.policy.disable();
+            let message = "Paused /poke until your next message. The current turn is not cancelled."
+                .to_string();
             state.last_notice = Some(message.clone());
             let data = status_data(session_id, state)?;
             Ok(Some((data, message)))
@@ -163,6 +269,10 @@ pub(super) fn control(
     update_state(session_id, |state| {
         if command == "poke" {
             state.poke_enabled = false;
+            state.rearm_on_user_turn = false;
+            state.user_prompt_since_pause = false;
+            state.paused_at_unix_secs = None;
+            state.paused_todo_fingerprint = None;
             if let Some(workflow) = state.workflow.as_mut() {
                 workflow.active = false;
             }
@@ -383,29 +493,88 @@ pub(super) async fn run_reserved_followups(
 ) -> Result<()> {
     agent.validate_server_turn(lease)?;
     let session_id = agent.session_id().to_string();
-    if !state_path(&session_id)?.exists() {
-        return Ok(());
-    }
-    for _ in 0..MAX_CONTINUATIONS_PER_TURN {
+    initialize_remote_session(&session_id, crate::config::config().features.auto_poke)?;
+    // Bound retries by unchanged todo state, not total productive turns. A long
+    // cloud campaign can legitimately make progress across hundreds of turns.
+    // The persisted policy still limits no-progress retries and quality gates.
+    loop {
         if agent.graceful_shutdown_signal().is_set() {
             return Ok(());
         }
         let mut snapshot = snapshot(&session_id)?;
-        snapshot.running_background_tasks = crate::background::global()
-            .list()
-            .await
-            .into_iter()
-            .filter(|task| {
-                task.session_id == session_id
-                    && matches!(task.status, crate::bus::BackgroundTaskStatus::Running)
+        snapshot.running_workers = snapshot
+            .todos
+            .iter()
+            .filter_map(|todo| todo.assigned_to.as_ref())
+            .filter(|id| {
+                id.as_str() != session_id && crate::turn_cancel_registry::has_active_turn(id)
             })
-            .map(|task| task.task_id)
+            .cloned()
             .collect();
-        let decision = update_state(&session_id, |state| Ok(next_followup(state, &snapshot)))?;
+        // The process-backed task list cannot see durable await_members waits.
+        // Keep those verified by the snapshot, replacing only process facts.
+        snapshot
+            .running_background_tasks
+            .retain(|id| id.starts_with(todo::await_dependency::ID_PREFIX));
+        snapshot.running_background_tasks.extend(
+            crate::background::global()
+                .list()
+                .await
+                .into_iter()
+                .filter(|task| {
+                    task.session_id == session_id
+                        && matches!(task.status, crate::bus::BackgroundTaskStatus::Running)
+                })
+                .map(|task| task.task_id),
+        );
+        let current_todo_fp = todo_fingerprint(&session_id);
+        let now_secs = now_unix_secs();
+        let decision = update_state(&session_id, |state| {
+            maybe_rearm_paused_state(&session_id, state, now_secs, current_todo_fp.as_deref());
+            state
+                .policy
+                .set_gate_digest_enabled(crate::config::config().features.todo_gate_digest);
+            Ok(next_followup(state, &snapshot))
+        })?;
         apply_effects(&session_id, &decision.effects)?;
         let Some(followup) = decision.follow_up else {
+            if let Some(notice) = decision.notice {
+                crate::logging::info(&format!(
+                    "Remote continuation paused for session {session_id}: {notice}"
+                ));
+                if let Err(error) = event_tx.send(ServerEvent::Notification {
+                    from_session: "runtime".into(),
+                    from_name: Some("cloud continuation".into()),
+                    notification_type: crate::protocol::NotificationType::Message {
+                        scope: Some("runtime".into()),
+                        channel: None,
+                        tldr: None,
+                    },
+                    message: notice,
+                }) {
+                    crate::logging::debug(&format!(
+                        "Could not broadcast remote continuation pause for {session_id}: {error}"
+                    ));
+                }
+            }
             return Ok(());
         };
+        // Publish continuation as progress, never a terminal event. Every
+        // observer sees the same harness decision without dispatching a poke.
+        let _ = event_tx.send(ServerEvent::Notification {
+            from_session: "runtime".into(),
+            from_name: Some("daemon continuation".into()),
+            notification_type: crate::protocol::NotificationType::Message {
+                scope: Some("runtime".into()),
+                channel: None,
+                tldr: None,
+            },
+            message: followup.notice.clone(),
+        });
+        crate::logging::info(&format!(
+            "AUTO_POKE_DECISION owner=daemon session={session_id} action=continue kind={:?}",
+            followup.kind
+        ));
         // Persisted budgets are committed before the request. A daemon restart
         // cannot turn a failing continuation into an unlimited retry loop.
         let result = super::client_lifecycle::process_reserved_message_streaming_mpsc(
@@ -440,18 +609,6 @@ pub(super) async fn run_reserved_followups(
         }
         result?;
     }
-    update_state(&session_id, |state| {
-        state.policy.disable();
-        state.poke_enabled = false;
-        if let Some(workflow) = state.workflow.as_mut() {
-            workflow.active = false;
-        }
-        state.last_notice = Some(
-            "Paused at the server continuation safety limit. Inspect status before resuming."
-                .into(),
-        );
-        Ok(())
-    })
 }
 
 #[cfg(test)]

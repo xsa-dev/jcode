@@ -108,6 +108,7 @@ fn resumed_long_session_matches_live_transcript_and_numbered_composer() {
             session_id: "parity-no-disk-load".into(),
         },
         external_path: None,
+        user_intention: None,
         todo_statuses: Vec::new(),
     };
     for width in [40, 80, 120] {
@@ -123,15 +124,23 @@ fn resumed_long_session_matches_live_transcript_and_numbered_composer() {
         let mut preview = Terminal::new(TestBackend::new(width, height)).unwrap();
         reset_prompt_viewport_state_for_test();
         live.draw(|f| draw(f, &state)).unwrap();
+        let live_status = last_status_area().expect("live draw records its activity row");
+        assert_eq!(live_status.height, 1);
+        assert_eq!(live_status.y, height - 3);
         let mut picker = SessionPicker::new(vec![session.clone()]);
         preview.draw(|f| picker.render(f)).unwrap();
         // The compact card is confined to the right half. Compare all visible
         // conversation cells on the left, including top sticky prompt and input.
+        // A saved-session preview deliberately has no live activity row. Exclude
+        // only that recorded row, not the numbered composer directly below it.
         let card_width = ((u32::from(width) * 36 / 100) as u16)
             .clamp(30, 52)
             .min(width.saturating_sub(12).max(1));
         let safe_width = width.saturating_sub(card_width + 2).min(width / 2);
         for y in 0..height - 1 {
+            if y == live_status.y {
+                continue;
+            }
             for x in 0..safe_width {
                 assert_eq!(
                     preview.backend().buffer()[(x, y)],

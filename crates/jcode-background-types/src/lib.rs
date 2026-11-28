@@ -99,7 +99,7 @@ pub struct BackgroundTaskProgressEvent {
 }
 
 /// Event sent when a background task completes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundTaskCompleted {
     pub task_id: String,
     pub tool_name: String,
@@ -122,6 +122,8 @@ pub struct BackgroundTaskCompleted {
 /// silence episode; new output or progress re-arms it.
 #[derive(Debug, Clone)]
 pub struct BackgroundTaskStalled {
+    /// True for a runtime checkpoint independent of output or progress.
+    pub elapsed_review: bool,
     pub task_id: String,
     pub tool_name: String,
     pub display_name: Option<String>,

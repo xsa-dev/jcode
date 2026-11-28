@@ -7,9 +7,9 @@ use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
-use crate::{browser, gateway, memory, session, storage, tui};
+use crate::{browser, gateway, memory, session, storage};
 
-use super::{output::terminal_title, terminal::init_tui_runtime};
+mod ambient;
 
 mod menubar;
 mod provider_setup;
@@ -32,13 +32,7 @@ pub use restart::{
     run_restart_restore_command, run_restart_save_command, run_restart_status_command,
 };
 
-pub enum AmbientSubcommand {
-    Status,
-    Log,
-    Trigger,
-    Stop,
-    RunVisible,
-}
+pub use ambient::{AmbientSubcommand, run_ambient_command};
 
 pub enum CloudSubcommand {
     Sessions(CloudSessionsSubcommand),
@@ -1399,22 +1393,6 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-pub async fn run_ambient_command(cmd: AmbientSubcommand) -> Result<()> {
-    if let AmbientSubcommand::RunVisible = cmd {
-        return run_ambient_visible().await;
-    }
-
-    let debug_cmd = match cmd {
-        AmbientSubcommand::Status => "ambient:status",
-        AmbientSubcommand::Log => "ambient:log",
-        AmbientSubcommand::Trigger => "ambient:trigger",
-        AmbientSubcommand::Stop => "ambient:stop",
-        AmbientSubcommand::RunVisible => unreachable!(),
-    };
-
-    super::debug::run_debug_command(debug_cmd, "", None, None, false).await
-}
-
 pub async fn run_transcript_command(
     text: Option<String>,
     mode: crate::protocol::TranscriptMode,
@@ -1454,7 +1432,36 @@ pub async fn run_transcript_command(
     }
 }
 
-pub async fn run_companion_command(status: bool, no_voice: bool) -> Result<()> {
+/// `jcode companion --no-*` flags. Each turns a feature off on top of the
+/// `[companion]` config. A flag can never turn on something config disables.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompanionFlags {
+    pub no_voice: bool,
+    pub no_voice_waveform: bool,
+    pub no_voice_notifications: bool,
+    pub no_jarvis_fn_key: bool,
+    pub no_jarvis_fn_launch: bool,
+    pub no_open: bool,
+    pub no_spawn_terminal: bool,
+    pub no_lid: bool,
+    pub no_browser_updates: bool,
+}
+
+impl CompanionFlags {
+    pub fn apply(self, options: &mut jcode_companion::CompanionOptions) {
+        options.voice &= !self.no_voice;
+        options.voice_waveform &= !self.no_voice_waveform;
+        options.voice_notifications &= !self.no_voice_notifications;
+        options.jarvis_fn_key &= !self.no_jarvis_fn_key;
+        options.jarvis_fn_launch &= !self.no_jarvis_fn_launch;
+        options.open &= !self.no_open;
+        options.spawn_terminal &= !self.no_spawn_terminal;
+        options.lid &= !self.no_lid;
+        options.browser_updates &= !self.no_browser_updates;
+    }
+}
+
+pub async fn run_companion_command(status: bool, flags: CompanionFlags) -> Result<()> {
     use crate::companion_client::{CompanionRequest, request_async};
     if status {
         match request_async(CompanionRequest::Status, std::time::Duration::from_secs(2)).await {
@@ -1470,11 +1477,9 @@ pub async fn run_companion_command(status: bool, no_voice: bool) -> Result<()> {
             Err(error) => anyhow::bail!("{error}"),
         }
     }
-    jcode_companion::run(jcode_companion::CompanionOptions {
-        voice: !no_voice,
-        ..Default::default()
-    })
-    .await
+    let mut options = jcode_companion::CompanionOptions::from_config();
+    flags.apply(&mut options);
+    jcode_companion::run(options).await
 }
 
 pub async fn run_dictate_command(type_output: bool) -> Result<()> {
@@ -1537,51 +1542,6 @@ pub fn run_session_rename_command(
         );
     }
 
-    Ok(())
-}
-
-async fn run_ambient_visible() -> Result<()> {
-    use crate::ambient::VisibleCycleContext;
-
-    let context = VisibleCycleContext::load().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to load visible cycle context: {}\nIs the ambient runner running?",
-            e
-        )
-    })?;
-
-    let (provider, registry) = super::provider_init::init_provider_and_registry(
-        &super::provider_init::ProviderChoice::Auto,
-        None,
-    )
-    .await?;
-
-    registry.register_ambient_tools().await;
-
-    let safety = std::sync::Arc::new(crate::safety::SafetySystem::new());
-    crate::tool::ambient::init_safety_system(safety);
-
-    let (terminal, tui_runtime) = init_tui_runtime()?;
-
-    let mut app = tui::App::new(provider, registry);
-    app.set_ambient_mode(context.system_prompt, context.initial_message);
-
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::SetTitle(terminal_title("🤖 jcode ambient cycle"))
-    );
-
-    let result = app.run(terminal).await;
-
-    tui_runtime.finish(true);
-
-    if let Some(cycle_result) = crate::tool::ambient::take_cycle_result() {
-        let result_path = VisibleCycleContext::result_path()?;
-        crate::storage::write_json(&result_path, &cycle_result)?;
-        eprintln!("Ambient cycle result saved.");
-    }
-
-    result?;
     Ok(())
 }
 
@@ -2601,6 +2561,11 @@ Re-run with `--force` if you really want to stop the server.";
     Ok(())
 }
 
+/// Run a standalone, in-process agent, including its local continuation loop.
+///
+/// Even when a daemon is available (or started on demand for swarm tools), it
+/// does not own this agent or receive its turns. Daemon-owned auto-poke applies
+/// only to daemon sessions, so these local loops must remain enabled here.
 pub async fn run_single_message_command(
     choice: &super::provider_init::ProviderChoice,
     model: Option<&str>,
@@ -2836,8 +2801,8 @@ fn run_command_auto_poke_limit_reached(turns_completed: usize, max_turns: Option
 mod todo_followup;
 use todo_followup::{
     RunAutoPokeFollowUp, build_run_auto_poke_follow_up_from_todos, prepare_run_todo_follow_up,
-    run_actionable_poke_message, run_blocked_notice, run_completely_blocked_notice,
-    run_external_blocker_notice, run_todos, take_run_gate_digest_if_turn_ended,
+    run_actionable_poke_message, run_blocked_notice, run_cannot_complete_notice, run_goals,
+    run_todos, run_user_auth_notice, take_run_gate_digest_if_turn_ended,
 };
 #[cfg(test)]
 use todo_followup::{run_actionable_todos, take_run_gate_digest};
@@ -2851,6 +2816,7 @@ async fn run_single_message_command_plain_with_auto_poke(
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
     let mut gate_digest_delivered = false;
+    let mut delivery_budget = todo_followup::RunDeliveryBudget::default();
     let mut incomplete_budget = crate::todo::IncompleteTodoBudget::default();
     loop {
         agent.run_once(&next_message).await?;
@@ -2875,7 +2841,7 @@ async fn run_single_message_command_plain_with_auto_poke(
         if todos.iter().any(crate::todo::is_incomplete_todo)
             && !actionable_todos.iter().any(crate::todo::is_incomplete_todo)
         {
-            eprintln!("{}", run_blocked_notice(&todos).unwrap_or_else(||
+            eprintln!("{}", run_blocked_notice(&todos, &run_goals(agent.session_id())).unwrap_or_else(||
                 "Stopped at the turn limit with unfinished todos waiting on background dependencies.".into()
             ));
             break;
@@ -2887,6 +2853,23 @@ async fn run_single_message_command_plain_with_auto_poke(
             );
             break;
         }
+        if let Some(delivery) = delivery_budget.follow_up(
+            &todos,
+            || run_goals(agent.session_id()),
+            run_command_auto_poke_limit_reached(turns_completed, max_turns),
+        ) {
+            match delivery {
+                Ok(message) => {
+                    eprintln!("Continuing because a requested goal is still undelivered.");
+                    next_message = message;
+                    continue;
+                }
+                Err(reason) => {
+                    eprintln!("Stopped with an undelivered goal ({reason}).");
+                    break;
+                }
+            }
+        }
         let gate_digest = take_run_gate_digest_if_turn_ended(
             agent.session_id(),
             gate_digest_delivered,
@@ -2894,6 +2877,7 @@ async fn run_single_message_command_plain_with_auto_poke(
             crate::config::config().features.todo_gate_digest,
         );
         match build_run_auto_poke_follow_up_from_todos(
+            crate::config::config().features.todo_gate_digest,
             &actionable_todos,
             confidence_spike_challenged,
             gate_digest,
@@ -2968,6 +2952,7 @@ async fn run_single_message_command_capture_with_auto_poke(
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
     let mut gate_digest_delivered = false;
+    let mut delivery_budget = todo_followup::RunDeliveryBudget::default();
     let mut incomplete_budget = crate::todo::IncompleteTodoBudget::default();
     loop {
         outputs.push(agent.run_once_capture(&next_message).await?);
@@ -2992,7 +2977,7 @@ async fn run_single_message_command_capture_with_auto_poke(
         if todos.iter().any(crate::todo::is_incomplete_todo)
             && !actionable_todos.iter().any(crate::todo::is_incomplete_todo)
         {
-            eprintln!("{}", run_blocked_notice(&todos).unwrap_or_else(||
+            eprintln!("{}", run_blocked_notice(&todos, &run_goals(agent.session_id())).unwrap_or_else(||
                 "Stopped at the turn limit with unfinished todos waiting on background dependencies.".into()
             ));
             break;
@@ -3004,6 +2989,23 @@ async fn run_single_message_command_capture_with_auto_poke(
             );
             break;
         }
+        if let Some(delivery) = delivery_budget.follow_up(
+            &todos,
+            || run_goals(agent.session_id()),
+            run_command_auto_poke_limit_reached(turns_completed, max_turns),
+        ) {
+            match delivery {
+                Ok(message) => {
+                    eprintln!("Continuing because a requested goal is still undelivered.");
+                    next_message = message;
+                    continue;
+                }
+                Err(reason) => {
+                    eprintln!("Stopped with an undelivered goal ({reason}).");
+                    break;
+                }
+            }
+        }
         let gate_digest = take_run_gate_digest_if_turn_ended(
             agent.session_id(),
             gate_digest_delivered,
@@ -3011,6 +3013,7 @@ async fn run_single_message_command_capture_with_auto_poke(
             crate::config::config().features.todo_gate_digest,
         );
         match build_run_auto_poke_follow_up_from_todos(
+            crate::config::config().features.todo_gate_digest,
             &actionable_todos,
             confidence_spike_challenged,
             gate_digest,
@@ -3108,6 +3111,7 @@ async fn run_single_message_command_ndjson(
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
     let mut gate_digest_delivered = false;
+    let mut delivery_budget = todo_followup::RunDeliveryBudget::default();
     let mut incomplete_budget = crate::todo::IncompleteTodoBudget::default();
     loop {
         let turn_result = {
@@ -3178,11 +3182,10 @@ async fn run_single_message_command_ndjson(
                 &serde_json::json!({
                     "type": "auto_poke_stopped",
                     "session_id": session_id,
-                    "reason": if run_completely_blocked_notice(&todos).is_some() { "completely_blocked" } else if run_external_blocker_notice(&todos).is_some() { "external_blocker" } else { "turn_limit" },
-                    "message": run_blocked_notice(&todos),
-                    "completely_blocked": todos.iter().any(crate::todo::todo_completely_blocked),
+                    "reason": if run_user_auth_notice(&todos).is_some() { "requires_user_auth" } else if run_cannot_complete_notice(&todos, &run_goals(&session_id)).is_some() { "cannot_complete" } else { "turn_limit" },
+                    "message": run_blocked_notice(&todos, &run_goals(&session_id)),
+                    "requires_user_auth": todos.iter().any(crate::todo::todo_requires_user_auth),
                     "waiting_on_background": todos.iter().any(|todo| !todo.waiting_on.is_empty()),
-                    "waiting_on_external": todos.iter().any(crate::todo::todo_has_external_blocker),
                     "max_turns": max_turns,
                 }),
             )?;
@@ -3201,6 +3204,33 @@ async fn run_single_message_command_ndjson(
             )?;
             break;
         }
+        if let Some(delivery) = delivery_budget.follow_up(
+            &todos,
+            || run_goals(agent.session_id()),
+            run_command_auto_poke_limit_reached(turns_completed, max_turns),
+        ) {
+            match delivery {
+                Ok(message) => {
+                    write_json_line(
+                        &mut stdout,
+                        &serde_json::json!({
+                            "type": "auto_poke_goal_delivery", "session_id": session_id, "message": message,
+                        }),
+                    )?;
+                    next_message = message;
+                    continue;
+                }
+                Err(reason) => {
+                    write_json_line(
+                        &mut stdout,
+                        &serde_json::json!({
+                            "type": "auto_poke_stopped", "session_id": session_id, "reason": reason,
+                        }),
+                    )?;
+                    break;
+                }
+            }
+        }
         let gate_digest = take_run_gate_digest_if_turn_ended(
             agent.session_id(),
             gate_digest_delivered,
@@ -3208,6 +3238,7 @@ async fn run_single_message_command_ndjson(
             crate::config::config().features.todo_gate_digest,
         );
         match build_run_auto_poke_follow_up_from_todos(
+            crate::config::config().features.todo_gate_digest,
             &actionable_todos,
             confidence_spike_challenged,
             gate_digest,
@@ -3345,227 +3376,9 @@ pub(super) fn unwrap_turn_event(
     event
 }
 
-fn emit_ndjson_event(
-    stdout: &mut impl Write,
-    state: &mut NdjsonRunState,
-    event: crate::protocol::ServerEvent,
-) -> Result<()> {
-    use crate::protocol::ServerEvent;
-
-    match unwrap_turn_event(event) {
-        ServerEvent::TextDelta { text } => {
-            state.text.push_str(&text);
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "text_delta", "text": text }),
-            )
-        }
-        ServerEvent::TextReplace { text } => {
-            state.text = text.clone();
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "text_replace", "text": text }),
-            )
-        }
-        ServerEvent::TextSuffixReplace { old_text, new_text } => {
-            crate::message::replace_text_suffix(&mut state.text, &old_text, &new_text);
-            write_json_line(
-                stdout,
-                &serde_json::json!({
-                    "type": "text_suffix_replace", "old_text": old_text, "new_text": new_text,
-                }),
-            )
-        }
-        ServerEvent::ToolStart { id, name } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "tool_start", "id": id, "name": name }),
-        ),
-        ServerEvent::ToolInput { delta, .. } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "tool_input", "delta": delta }),
-        ),
-        ServerEvent::ToolExec { id, name } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "tool_exec", "id": id, "name": name }),
-        ),
-        ServerEvent::ToolDone {
-            id,
-            name,
-            output,
-            error,
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "tool_done",
-                "id": id,
-                "name": name,
-                "output": output,
-                "error": error,
-            }),
-        ),
-        ServerEvent::TokenUsage {
-            input,
-            output,
-            cache_read_input,
-            cache_creation_input,
-            ..
-        } => {
-            state.usage = crate::agent::TokenUsage {
-                input_tokens: input,
-                output_tokens: output,
-                cache_read_input_tokens: cache_read_input,
-                cache_creation_input_tokens: cache_creation_input,
-            };
-            write_json_line(
-                stdout,
-                &serde_json::json!({
-                    "type": "tokens",
-                    "input": input,
-                    "output": output,
-                    "cache_read_input": cache_read_input,
-                    "cache_creation_input": cache_creation_input,
-                }),
-            )
-        }
-        ServerEvent::ServiceTierReported { requested, tier } => {
-            state.requested_service_tier = requested.clone();
-            state.served_service_tier = Some(tier.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({
-                    "type": "service_tier",
-                    "requested": requested,
-                    "tier": tier,
-                    "report_status": state.service_tier_report_status(),
-                }),
-            )
-        }
-        ServerEvent::ConnectionType { connection } => {
-            state.connection_type = Some(connection.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "connection_type", "connection": connection }),
-            )
-        }
-        ServerEvent::ConnectionPhase { phase } => {
-            state.connection_phase = Some(phase.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "connection_phase", "phase": phase }),
-            )
-        }
-        ServerEvent::StatusDetail { detail } => {
-            state.status_detail = Some(detail.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "status_detail", "detail": detail }),
-            )
-        }
-        ServerEvent::MessageEnd { stop_reason } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "message_end", "stop_reason": stop_reason }),
-        ),
-        ServerEvent::UpstreamProvider { provider } => {
-            state.upstream_provider = Some(provider.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "upstream_provider", "provider": provider }),
-            )
-        }
-        ServerEvent::SessionId { session_id } => {
-            state.session_id = Some(session_id.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "session", "session_id": session_id }),
-            )
-        }
-        ServerEvent::Compaction {
-            trigger,
-            pre_tokens,
-            messages_dropped,
-            post_tokens,
-            tokens_saved,
-            duration_ms,
-            messages_compacted,
-            summary_chars,
-            active_messages,
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "compaction",
-                "trigger": trigger,
-                "pre_tokens": pre_tokens,
-                "messages_dropped": messages_dropped,
-                "post_tokens": post_tokens,
-                "tokens_saved": tokens_saved,
-                "duration_ms": duration_ms,
-                "messages_compacted": messages_compacted,
-                "summary_chars": summary_chars,
-                "active_messages": active_messages,
-            }),
-        ),
-        ServerEvent::MemoryInjected {
-            count,
-            prompt_chars,
-            computed_age_ms,
-            ..
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "memory_injected",
-                "count": count,
-                "prompt_chars": prompt_chars,
-                "computed_age_ms": computed_age_ms,
-            }),
-        ),
-        ServerEvent::Interrupted => {
-            write_json_line(stdout, &serde_json::json!({ "type": "interrupted" }))
-        }
-        ServerEvent::SoftInterruptInjected {
-            content,
-            display_role,
-            point,
-            tools_skipped,
-            client_ids,
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "soft_interrupt_injected",
-                "content": content,
-                "display_role": display_role,
-                "point": point,
-                "tools_skipped": tools_skipped,
-                "client_ids": client_ids,
-            }),
-        ),
-        ServerEvent::BatchProgress { progress } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "batch_progress", "progress": progress }),
-        ),
-        ServerEvent::Error {
-            message,
-            retry_after_secs,
-            ..
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "error",
-                "message": message,
-                "retry_after_secs": retry_after_secs,
-            }),
-        ),
-        ServerEvent::Ack { .. } | ServerEvent::Done { .. } | ServerEvent::Pong { .. } => Ok(()),
-        _ => Ok(()),
-    }
-}
-
-fn write_json_line(stdout: &mut impl Write, value: &impl Serialize) -> Result<()> {
-    serde_json::to_writer(&mut *stdout, value)?;
-    stdout.write_all(b"\n")?;
-    stdout.flush()?;
-    Ok(())
-}
-
+#[path = "commands_json_output.rs"]
+mod json_output;
+use json_output::*;
 #[path = "commands/model_listing.rs"]
 mod model_listing;
 

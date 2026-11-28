@@ -10,14 +10,15 @@ fn uncapped_and_preserves_every_todo_field() {
             priority: "high".into(),
             group: Some("lane".into()),
             lane_after: None,
+            lane_owner: None,
             details: Some(format!("Full details {i}")),
             confidence: Some(ConfidenceState::Verified),
             completion_confidence: Some(ConfidenceState::Validated),
             confidence_history: vec![ConfidenceState::Speculative, ConfidenceState::Verified],
             assigned_to: Some("worker".into()),
             blocked_by: vec!["dependency".into()],
-            completely_blocked: None,
-            external_blocker: None,
+            requires_user_auth: None,
+            waiting_reason: None,
             waiting_on: vec!["background-task".into()],
             stage: Some(2),
         })
@@ -45,14 +46,15 @@ fn improved_histories_remain_prominent_and_all_goal_fields_render() {
     let plan = TodoPlan {
         title: None,
         user_intention: Some("Deliver outcome".into()),
-        understands_user_intent: Some(IntentUnderstanding::Complete),
+        understands_user_intent: Some(IntentUnderstanding::Clear),
         understands_user_intent_history: vec![
             IntentUnderstanding::Uncertain,
-            IntentUnderstanding::Complete,
+            IntentUnderstanding::Clear,
         ],
     };
     let goal = TodoGoal {
         group: Some("lane".into()),
+        cannot_complete: None,
         feedback_loop: Some("Run acceptance workflow".into()),
         closed_feedback_loop: Some(FeedbackLoopState::Closed),
         closed_feedback_loop_history: vec![FeedbackLoopState::Absent, FeedbackLoopState::Closed],
@@ -71,8 +73,13 @@ fn improved_histories_remain_prominent_and_all_goal_fields_render() {
             FeedbackLoopTraceability::Unmapped,
             FeedbackLoopTraceability::Complete,
         ],
-        delivery_state: Some(DeliveryState::OutcomeDelivered),
-        delivery_state_history: vec![DeliveryState::ChangeMade, DeliveryState::OutcomeDelivered],
+        delivery_state: Some(DeliveryState::Delivered),
+        delivery_state_history: vec![DeliveryState::Undelivered, DeliveryState::Delivered],
+        verification_state: Some(VerificationState::CheckedEndToEnd),
+        verification_state_history: vec![
+            VerificationState::Unchecked,
+            VerificationState::CheckedEndToEnd,
+        ],
         difficulty: Some(Difficulty::Involved),
         autonomy: Some(Autonomy::NecessaryFollowthrough),
         iteration_maturity: Some(IterationMaturity::OutcomeReached),
@@ -92,7 +99,7 @@ fn improved_histories_remain_prominent_and_all_goal_fields_render() {
         "synthetic",
         "narrow",
         "unmapped",
-        "change&#95;made",
+        "undelivered",
     ] {
         assert!(earlier.contains(value), "{value}");
     }
@@ -103,6 +110,8 @@ fn improved_histories_remain_prominent_and_all_goal_fields_render() {
         "Autonomy (descriptive)",
         "Iteration maturity",
         "Delivery state history",
+        "Verification state history",
+        "checked&#95;end&#95;to&#95;end",
         "Feedback loop traceability history",
     ] {
         assert!(report.contains(value), "{value}");

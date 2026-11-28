@@ -197,16 +197,14 @@ impl SessionPicker {
         &self,
         session: &SessionInfo,
         is_selected: bool,
-        _spinner_frame: usize,
+        spinner_frame: usize,
     ) -> Vec<Line<'static>> {
         let dim: Color = rgb(100, 100, 100);
         let dimmer: Color = rgb(70, 70, 70);
         let batch_restore: Color = rgb(255, 140, 140);
 
-        // The list is ordered by last activity, so show that instead of the
-        // creation time (a day-old session active a minute ago sits on top).
-        let active_ago =
-            format_time_ago(session.last_active_at.unwrap_or(session.last_message_time));
+        // Same timestamp the list is sorted by (`display.resume_time`).
+        let active_ago = format_time_ago(session_resume_time(session));
         let in_batch_restore = self.crashed_session_ids.contains(&session.id);
         let is_marked = self.selected_session_ids.contains(&session.id);
         let same_dir = self.session_in_current_dir(session);
@@ -322,14 +320,82 @@ impl SessionPicker {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        let activity = format!("  {active_ago}");
-        detail_spans.push(Span::styled(activity, Style::default().fg(dim)));
+        let (match_hint_line, transcript_only_match) =
+            Self::search_match_hint_line(session, &highlight_tokens);
+        if transcript_only_match {
+            detail_spans.push(Span::styled("  · transcript", Style::default().fg(dimmer)));
+        }
+        // A running turn is a state, not an age: show a spinner instead of
+        // a stale "x ago" that would count up while the agent is busy.
+        if self.session_is_streaming(session) {
+            let frames = jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES;
+            detail_spans.push(Span::styled(
+                format!("  {} running", frames[spinner_frame % frames.len()]),
+                Style::default().fg(rgb(255, 193, 7)),
+            ));
+        } else {
+            let activity = format!("  {active_ago}");
+            detail_spans.push(Span::styled(activity, Style::default().fg(dim)));
+        }
         let mut rows = vec![line1, Line::from(detail_spans)];
+        if let Some(hint_line) = match_hint_line {
+            rows.push(hint_line);
+        }
         if let Some(reason_line) = Self::crash_reason_line(session) {
             rows.push(reason_line);
         }
 
         rows
+    }
+
+    fn search_match_hint_line(
+        session: &SessionInfo,
+        highlight_tokens: &[String],
+    ) -> (Option<Line<'static>>, bool) {
+        if highlight_tokens.is_empty() {
+            return (None, false);
+        }
+        let title_lower = session.title.to_lowercase();
+        let label_lower = session
+            .save_label
+            .as_deref()
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        let title_covers_all = highlight_tokens.iter().all(|token| {
+            title_lower.contains(token.as_str()) || label_lower.contains(token.as_str())
+        });
+        if title_covers_all {
+            return (None, false);
+        }
+        let label_style = Style::default().fg(rgb(130, 140, 155));
+        let text_style = Style::default().fg(rgb(155, 165, 180));
+        if let Some(intention) = session.user_intention.as_deref() {
+            let lower = intention.to_lowercase();
+            if highlight_tokens.iter().any(|t| lower.contains(t.as_str())) {
+                let compact = intention.split_whitespace().collect::<Vec<_>>().join(" ");
+                let mut spans = vec![Span::styled("  intent: ", label_style)];
+                spans.extend(Self::highlight_spans(
+                    &compact,
+                    highlight_tokens,
+                    text_style,
+                ));
+                return (Some(Line::from(spans)), false);
+            }
+        }
+        if let Some(prompt) = session.first_user_prompt.as_deref() {
+            let lower = prompt.to_lowercase();
+            if highlight_tokens.iter().any(|t| lower.contains(t.as_str())) {
+                let compact = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+                let mut spans = vec![Span::styled("  prompt: ", label_style)];
+                spans.extend(Self::highlight_spans(
+                    &compact,
+                    highlight_tokens,
+                    text_style,
+                ));
+                return (Some(Line::from(spans)), false);
+            }
+        }
+        (None, true)
     }
 
     fn render_session_item(
@@ -414,6 +480,27 @@ impl SessionPicker {
         virtualize: bool,
     ) {
         self.poll_transcript_search();
+        // Reserve a compact warning row without substituting for local sessions.
+        // Keep it independent of loading state so Fresh(local) cannot erase it.
+        let area = if let Some(warning) = self.cloud_warning.as_deref().filter(|_| area.height > 2)
+        {
+            let line = Line::from(Span::styled(
+                warning.to_string(),
+                Style::default().fg(rgb(255, 200, 100)),
+            ));
+            let line = jcode_tui_render::truncate_line_with_ellipsis_to_width(
+                &line,
+                usize::from(area.width),
+            );
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect::new(area.x, area.y, area.width, 1),
+            );
+            Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+        } else {
+            area
+        };
+        self.last_list_area = Some(area);
         // List rows never wrap. Determine exact heights without formatting the
         // offscreen titles, prompts, paths, timestamps, or highlighted spans.
         let mut item_heights: Vec<usize> = self
@@ -658,21 +745,27 @@ impl SessionPicker {
 
         title_parts.push(Span::styled(" ", Style::default()));
 
-        let mut help = if self.search_active && self.loading_message.is_some() {
+        let mut help = if let Some(notice) = self.copy_notice {
+            format!(" {notice} ")
+        } else if self.search_submission_pending() {
+            " confirming best match… · waits ≤1s · ↑↓ take control · Esc cancel ".to_string()
+        } else if self.search_active && self.loading_message.is_some() {
             " type to filter · loading… · Esc clear · Ctrl+C cancel ".to_string()
         } else if self.loading_message.is_some() {
             " / search · s/S filter · Esc cancel ".to_string()
-        } else if self.transcript_search.pending() {
-            " searching full transcripts… · type to refine · Ctrl+C cancel ".to_string()
+        } else if self.search_busy_visible() && self.search_selection.following() {
+            " finding best match… · auto-focus ≤1s · ↑↓ take control · Enter confirm ".to_string()
+        } else if self.search_busy_visible() {
+            " searching in background… · selection held · ↑↓ nav · Enter confirm ".to_string()
         } else if self.search_active {
             " type to filter · Ctrl+J/K or ↑↓ nav · Ctrl+W word-del · Esc cancel ".to_string()
         } else {
             match crate::config::config().keybindings.session_picker_enter {
                 crate::config::SessionPickerResumeAction::CurrentTerminal => {
-                    " Space select · Enter in place · Ctrl+Enter new terminal · d debug · / search · h/l focus · ↑↓ · q ".to_string()
+                    " y copy ID · Space select · Enter in place · Ctrl+Enter new terminal · d debug · / search · h/l focus · ↑↓ · q ".to_string()
                 }
                 crate::config::SessionPickerResumeAction::NewTerminal => {
-                    " Space select · Enter new terminal · Ctrl+Enter in place · d debug · / search · h/l focus · ↑↓ · q ".to_string()
+                    " y copy ID · Space select · Enter new terminal · Ctrl+Enter in place · d debug · / search · h/l focus · ↑↓ · q ".to_string()
                 }
             }
         };
@@ -682,7 +775,9 @@ impl SessionPicker {
 
         let border_dim: Color = rgb(70, 70, 70);
         let border_focus: Color = rgb(130, 130, 160);
-        let border_color = if self.focus == PaneFocus::Sessions {
+        let border_color = if self.search_busy_visible() && self.search_selection.following() {
+            rgb(220, 180, 100)
+        } else if self.focus == PaneFocus::Sessions {
             border_focus
         } else {
             border_dim

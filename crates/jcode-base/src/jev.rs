@@ -10,15 +10,28 @@ use serde_json::{Map, Value, json};
 use std::time::Duration;
 
 mod laya;
-use laya::{
-    configured_laya_base, is_loopback_host, laya_endpoint, resolve_laya_with,
-    resolve_suggestions_with, should_bypass_proxy, validate_choice_answer,
-};
+use laya::{configured_laya_base, laya_endpoint, resolve_laya_with, should_bypass_proxy};
+
+/// Privacy-safe classification for continuous listeners, independent of diagnostic text.
+#[derive(Clone, Copy, Debug)]
+pub enum DecisionTransportFailure {
+    Network,
+    Http(u16),
+}
+
+impl std::fmt::Display for DecisionTransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network => f.write_str("Jev network request failed"),
+            Self::Http(status) => write!(f, "Jev returned HTTP {status}"),
+        }
+    }
+}
+impl std::error::Error for DecisionTransportFailure {}
 
 const PROVIDER_ENV: &str = "JCODE_MEMORY_JEV_PROVIDER";
 const BROWSER_PROVIDER_ENV: &str = "JCODE_BROWSER_JEV_PROVIDER";
 const VOICE_PROVIDER_ENV: &str = "JCODE_VOICE_JEV_PROVIDER";
-const SUGGESTIONS_PROVIDER_ENV: &str = "JCODE_SUGGESTIONS_JEV_PROVIDER";
 const LAYA_BASE_URL_ENV: &str = "JCODE_LAYA_BASE_URL";
 const LAYA_DEFAULT_BASE: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_MEMORY_JEV_MODEL: &str = "typesafe/jev-1.13";
@@ -52,7 +65,6 @@ enum JevPurpose {
     Memory,
     Browser,
     Voice,
-    Suggestions,
 }
 
 impl JevPurpose {
@@ -61,7 +73,6 @@ impl JevPurpose {
             Self::Memory => "memory",
             Self::Browser => "browser",
             Self::Voice => "voice",
-            Self::Suggestions => "suggestions",
         }
     }
 
@@ -69,44 +80,28 @@ impl JevPurpose {
         match self {
             Self::Memory => "memory_jev",
             Self::Browser => "browser_jev",
-            // Voice and Suggestions use the gateway's existing typed noul contract.
-            Self::Voice | Self::Suggestions => "memory_jev",
+            // Voice uses the gateway's existing typed noul contract.
+            Self::Voice => "memory_jev",
         }
     }
 
     fn selector_with(
         self,
         env: impl FnOnce(&str) -> Result<String, std::env::VarError>,
-        default_provider: impl FnOnce() -> String,
+        memory_default: impl FnOnce() -> String,
     ) -> Result<String> {
         let key = match self {
             Self::Memory => PROVIDER_ENV,
             Self::Browser => BROWSER_PROVIDER_ENV,
             Self::Voice => VOICE_PROVIDER_ENV,
-            Self::Suggestions => SUGGESTIONS_PROVIDER_ENV,
-        };
-        let fallback = || match self {
-            Self::Memory => default_provider(),
-            Self::Suggestions => {
-                let d = default_provider();
-                let trimmed = d.trim();
-                if trimmed.is_empty() {
-                    "auto".into()
-                } else {
-                    trimmed.to_owned()
-                }
-            }
-            Self::Browser | Self::Voice => "auto".into(),
         };
         match env(key) {
-            Ok(value) => {
-                if self == Self::Suggestions && value.trim().is_empty() {
-                    Ok(fallback())
-                } else {
-                    Ok(value)
-                }
-            }
-            Err(std::env::VarError::NotPresent) => Ok(fallback()),
+            Ok(value) => Ok(value),
+            Err(std::env::VarError::NotPresent) => Ok(match self {
+                Self::Memory => memory_default(),
+                Self::Browser => "auto".into(),
+                Self::Voice => "auto".into(),
+            }),
             Err(_) => bail!("{key} must contain a valid provider name"),
         }
     }
@@ -116,7 +111,6 @@ impl JevPurpose {
 enum JevProvider {
     OpenRouter,
     TypeSafe,
-    OpenJev,
     Laya,
     Aimlapi,
     Jcode,
@@ -127,7 +121,6 @@ impl JevProvider {
         match self {
             Self::OpenRouter => "openrouter",
             Self::TypeSafe => "typesafe",
-            Self::OpenJev => "openjev",
             Self::Laya => "laya",
             Self::Aimlapi => "aimlapi",
             Self::Jcode => "jcode",
@@ -138,7 +131,6 @@ impl JevProvider {
         match self {
             Self::OpenRouter => ("OPENROUTER_API_KEY", "openrouter.env"),
             Self::TypeSafe => ("TYPESAFE_API_KEY", "typesafe.env"),
-            Self::OpenJev => ("OPENJEV_API_KEY", "openjev.env"),
             Self::Laya => ("LAYA_API_KEY", "laya.env"),
             Self::Aimlapi => ("AIMLAPI_API_KEY", "aimlapi.env"),
             Self::Jcode => (
@@ -150,7 +142,7 @@ impl JevProvider {
 
     fn max_questions(self) -> usize {
         match self {
-            Self::TypeSafe | Self::OpenJev | Self::Laya => TYPESAFE_MAX_QUESTIONS,
+            Self::TypeSafe | Self::Laya => TYPESAFE_MAX_QUESTIONS,
             _ => MAX_QUESTIONS,
         }
     }
@@ -159,7 +151,6 @@ impl JevProvider {
         match self {
             Self::OpenRouter | Self::Jcode => DEFAULT_MEMORY_JEV_MODEL,
             Self::TypeSafe => "jev-latest",
-            Self::OpenJev => "openjev",
             Self::Laya => "laya-latest",
             Self::Aimlapi => "typesafe/jev",
         }
@@ -169,7 +160,6 @@ impl JevProvider {
         Ok(match self {
             Self::OpenRouter => "https://openrouter.ai/api/alpha/decisions".into(),
             Self::TypeSafe => "https://api.typesafe.ai/v1/systemone".into(),
-            Self::OpenJev => "https://api.openjev.sh/v1/systemone".into(),
             Self::Laya => laya_endpoint(gateway_base)?,
             Self::Aimlapi => "https://api.aimlapi.com/v1/decisions".into(),
             Self::Jcode => format!("{}/decisions", trusted_gateway_base(gateway_base)?),
@@ -191,7 +181,6 @@ fn configured_model_override(purpose: JevPurpose) -> Option<String> {
             "JCODE_VOICE_JEV_MODEL",
             crate::config::config().agents.voice_jev_model.clone(),
         ),
-        JevPurpose::Suggestions => return None,
     };
     resolve_model_override(std::env::var(env).ok(), configured)
 }
@@ -235,10 +224,6 @@ impl JevClient {
     /// probe. In particular, Jcode entitlement is checked live by `evaluate`.
     pub fn available() -> bool {
         Self::resolve(JevPurpose::Memory).is_ok()
-    }
-
-    pub fn suggestions_available() -> bool {
-        Self::resolve(JevPurpose::Suggestions).is_ok()
     }
 
     pub fn new() -> Result<Self> {
@@ -289,39 +274,19 @@ impl JevClient {
     }
 
     fn resolve(purpose: JevPurpose) -> Result<(JevProvider, String, String, Option<String>)> {
-        if purpose == JevPurpose::Suggestions {
-            return Self::resolve_with_suggestions_default(
-                &crate::config::config().suggested_replies.jev_provider,
-            );
-        }
         let selector = purpose.selector_with(
             |key| std::env::var(key),
             || crate::config::config().agents.memory_jev_provider.clone(),
         )?;
-        Self::resolve_for_selector(purpose, &selector)
-    }
-
-    fn resolve_with_suggestions_default(
-        config_default: &str,
-    ) -> Result<(JevProvider, String, String, Option<String>)> {
-        let selector = JevPurpose::Suggestions
-            .selector_with(|key| std::env::var(key), || config_default.to_owned())?;
-        Self::resolve_for_selector(JevPurpose::Suggestions, &selector)
-    }
-
-    fn resolve_for_selector(
-        purpose: JevPurpose,
-        selector: &str,
-    ) -> Result<(JevProvider, String, String, Option<String>)> {
         // Unlike the API-key helper, this does not consult registered
         // cross-provider fallback resolvers or the shared compatible slot.
         let load = |env: &str, file: &str| {
             crate::provider_catalog::load_env_value_from_env_or_config(env, file)
         };
-        let (provider, api_key) = match purpose {
-            JevPurpose::Voice => resolve_voice_with(selector, load)?,
-            JevPurpose::Suggestions => resolve_suggestions_with(selector, load)?,
-            _ => resolve_with(selector, load)?,
+        let (provider, api_key) = if purpose == JevPurpose::Voice {
+            resolve_voice_with(&selector, load)?
+        } else {
+            resolve_with(&selector, load)?
         };
         let base = match provider {
             JevProvider::Jcode => crate::subscription_api::configured_api_base(),
@@ -354,11 +319,29 @@ impl JevClient {
     /// Never retries using another provider or account after an auth/billing
     /// failure. Callers own the relevance threshold and uncertainty policy.
     pub async fn evaluate(&self, state: Value, questions: Map<String, Value>) -> Result<Value> {
+        self.evaluate_policy(state, questions, true).await
+    }
+
+    /// A single bounded classification, with no hedging or transient retries.
+    /// Retains the same provider binding, entitlement and typed-answer checks.
+    pub async fn evaluate_once(
+        &self,
+        state: Value,
+        questions: Map<String, Value>,
+    ) -> Result<Value> {
+        self.evaluate_policy(state, questions, false).await
+    }
+
+    async fn evaluate_policy(
+        &self,
+        state: Value,
+        questions: Map<String, Value>,
+        retry: bool,
+    ) -> Result<Value> {
         let body = request_body_with_model(
             self.purpose,
             self.provider,
             &self.model_id,
-            &self.endpoint,
             state,
             &questions,
         )?;
@@ -371,10 +354,10 @@ impl JevClient {
                 .send()
                 .await
                 .map_err(|_| {
-                    anyhow!(
+                    anyhow!(DecisionTransportFailure::Network).context(format!(
                         "Could not verify Jcode {} entitlement; try again later",
                         self.purpose.name()
-                    )
+                    ))
                 })?;
             let me = read_response(response, MAX_ME_BYTES, self.provider).await?;
             ensure!(
@@ -387,10 +370,17 @@ impl JevClient {
                 self.purpose.capability()
             );
         }
-        if self.purpose == JevPurpose::Voice {
+        if retry && self.purpose == JevPurpose::Voice {
             return self.send_hedged(body, &questions).await;
         }
-        let value = self.send(&self.endpoint, body).await?;
+        let value = if retry {
+            self.send(&self.endpoint, body).await?
+        } else {
+            let response = self
+                .send_once(&self.client, &self.endpoint, body.into())
+                .await?;
+            read_response(response, MAX_RESPONSE_BYTES, self.provider).await?
+        };
         validate_answers(&value, &questions).with_context(|| {
             format!(
                 "Jev model '{}' returned an incompatible Decisions response",
@@ -407,6 +397,9 @@ impl JevClient {
     /// while any other attempt is still pending.
     async fn send_hedged(&self, body: Vec<u8>, questions: &Map<String, Value>) -> Result<Value> {
         use futures::StreamExt;
+        // All attempts send identical immutable wire bytes. Share their backing
+        // rather than copying the full request for every hedge and retry.
+        let body = bytes::Bytes::from(body);
         let attempt = |client: &Client, delay: Duration, primary: bool| {
             let body = body.clone();
             let client = client.clone();
@@ -445,14 +438,19 @@ impl JevClient {
     }
 
     async fn send(&self, endpoint: &str, body: Vec<u8>) -> Result<Value> {
-        self.send_with(&self.client, endpoint, body).await
+        self.send_with(&self.client, endpoint, body.into()).await
     }
 
     /// Decisions requests are side-effect-free classifications, so transient
     /// overload responses (429/502/503/504/529) are retried with a short bounded
     /// backoff on the same provider and account. Auth, billing, redirect, and
     /// other failures are never retried and never fall back to another account.
-    async fn send_with(&self, client: &Client, endpoint: &str, body: Vec<u8>) -> Result<Value> {
+    async fn send_with(
+        &self,
+        client: &Client,
+        endpoint: &str,
+        body: bytes::Bytes,
+    ) -> Result<Value> {
         let mut attempt = 0;
         loop {
             let response = self.send_once(client, endpoint, body.clone()).await?;
@@ -487,7 +485,12 @@ impl JevClient {
         }
     }
 
-    async fn send_once(&self, client: &Client, endpoint: &str, body: Vec<u8>) -> Result<Response> {
+    async fn send_once(
+        &self,
+        client: &Client,
+        endpoint: &str,
+        body: bytes::Bytes,
+    ) -> Result<Response> {
         let mut request = client
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -507,12 +510,12 @@ impl JevClient {
                     JevPurpose::Memory => "Jcode Memory",
                     JevPurpose::Browser => "Jcode Browser",
                     JevPurpose::Voice => "Jcode Voice",
-                    JevPurpose::Suggestions => "Jcode Suggestions",
                 },
             );
         }
         request.send().await.map_err(|_| {
-            anyhow!("Jev decision request failed or timed out; check the selected provider")
+            anyhow!(DecisionTransportFailure::Network)
+                .context("Jev decision request failed or timed out; check the selected provider")
         })
     }
 }
@@ -563,110 +566,9 @@ fn client_builder_for(bypass_proxy: bool) -> reqwest::ClientBuilder {
     }
 }
 
-fn resolve_voice_with(
-    selector: &str,
-    load: impl FnMut(&str, &str) -> Option<String>,
-) -> Result<(JevProvider, String)> {
-    match selector.trim().to_ascii_lowercase().as_str() {
-        "auto" => resolve_providers(&[JevProvider::Jcode, JevProvider::TypeSafe], load),
-        "typesafe" | "laya" | "jcode" | "subscription" | "jcode-subscription" => {
-            resolve_with(selector, load)
-        }
-        _ => bail!(
-            "Invalid voice Jev provider. Choose auto, typesafe, laya, or jcode; voice never uses OpenRouter or AIMLAPI"
-        ),
-    }
-}
-
-fn resolve_with(
-    selector: &str,
-    mut load: impl FnMut(&str, &str) -> Option<String>,
-) -> Result<(JevProvider, String)> {
-    let providers: &[JevProvider] = match selector.trim().to_ascii_lowercase().as_str() {
-        "auto" => &[
-            // Included subscriber access wins over personal paid provider keys.
-            // Entitlement is checked live before evaluation. Failure must not
-            // silently spend a BYOK balance; users can select BYOK explicitly.
-            // Typesafe serves Jev directly, so it beats resellers of the same model.
-            JevProvider::Jcode,
-            JevProvider::TypeSafe,
-            JevProvider::OpenRouter,
-            JevProvider::Aimlapi,
-        ],
-        "openrouter" => &[JevProvider::OpenRouter],
-        "typesafe" => &[JevProvider::TypeSafe],
-        "openjev" => &[JevProvider::OpenJev],
-        "laya" => return resolve_laya_with(&mut load),
-        "aimlapi" => &[JevProvider::Aimlapi],
-        "jcode" | "subscription" | "jcode-subscription" => &[JevProvider::Jcode],
-        _ => bail!(
-            "Invalid Jev provider. Choose auto, laya, openjev, openrouter, typesafe, aimlapi, or jcode"
-        ),
-    };
-    resolve_providers(providers, load)
-}
-
-fn resolve_providers(
-    providers: &[JevProvider],
-    mut load: impl FnMut(&str, &str) -> Option<String>,
-) -> Result<(JevProvider, String)> {
-    for &provider in providers {
-        let (env, file) = provider.credentials();
-        if let Some(key) = load(env, file) {
-            let key = jcode_provider_env::sanitize_secret_value(&key);
-            if !key.is_empty() {
-                // Reject malformed headers now rather than leaking a provider's
-                // request-builder error through a later error chain.
-                ensure!(
-                    reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_ok(),
-                    "The selected Jev provider credential is not a valid HTTP bearer value"
-                );
-                return Ok((provider, key.to_owned()));
-            }
-        }
-    }
-    if let [provider] = providers {
-        let (env, file) = provider.credentials();
-        bail!(
-            "No credential for the selected Jev provider {}. Configure {env} ({file}). Explicit provider selection never falls back to another account.",
-            provider.name()
-        );
-    }
-    let credentials = providers
-        .iter()
-        .map(|provider| {
-            let (env, file) = provider.credentials();
-            format!("{env} ({file})")
-        })
-        .collect::<Vec<_>>()
-        .join(" or ");
-    bail!(
-        "No credential for the selected Jev route. Configure {credentials}. Provider failures never fall back to another account."
-    )
-}
-
-fn trusted_gateway_base(base: &str) -> Result<String> {
-    let url = Url::parse(base.trim()).map_err(|_| anyhow!("Invalid Jcode gateway base URL"))?;
-    let loopback = url.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    ensure!(
-        url.host_str().is_some()
-            && (url.scheme() == "https" || (url.scheme() == "http" && loopback))
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none(),
-        "Jcode Jev gateway requires HTTPS (HTTP only for loopback), without URL credentials, query, or fragment"
-    );
-    Ok(url.as_str().trim_end_matches('/').to_owned())
-}
-
+#[path = "jev/route_resolution.rs"]
+mod route_resolution;
+use route_resolution::{resolve_voice_with, resolve_with, trusted_gateway_base};
 #[cfg(test)]
 fn request_body(
     provider: JevProvider,
@@ -683,14 +585,13 @@ fn request_body_for(
     state: Value,
     questions: &Map<String, Value>,
 ) -> Result<Vec<u8>> {
-    request_body_with_model(purpose, provider, provider.model(), "", state, questions)
+    request_body_with_model(purpose, provider, provider.model(), state, questions)
 }
 
 fn request_body_with_model(
     purpose: JevPurpose,
     provider: JevProvider,
     model: &str,
-    endpoint: &str,
     state: Value,
     questions: &Map<String, Value>,
 ) -> Result<Vec<u8>> {
@@ -764,18 +665,10 @@ fn request_body_with_model(
         } else {
             state
         };
-    let mut payload = json!({
+    let body = serde_json::to_vec(&json!({
         "model": model, "state": state, "questions": questions
-    });
-    if provider == JevProvider::Laya
-        && reqwest::Url::parse(endpoint)
-            .ok()
-            .and_then(|url| url.host_str().map(is_loopback_host))
-            == Some(true)
-    {
-        payload["max_len"] = json!(4096);
-    }
-    let body = serde_json::to_vec(&payload).map_err(|_| anyhow!("Could not encode Jev request"))?;
+    }))
+    .map_err(|_| anyhow!("Could not encode Jev request"))?;
     ensure!(
         body.len() <= MAX_REQUEST_BYTES,
         "Jev request exceeds the bounded context size"
@@ -828,9 +721,9 @@ async fn read_response(
                 crate::subscription_notice::record(quota.clone());
                 return Err(quota.into());
             }
-            bail!(
+            return Err(anyhow!(DecisionTransportFailure::Http(429)).context(
                 "Jev returned HTTP 429: selected provider is rate limited or overloaded; try again later"
-            );
+            ));
         }
         let hint = match status.as_u16() {
             401 => "selected provider credential is invalid or revoked",
@@ -841,7 +734,8 @@ async fn read_response(
             300..=399 => "redirect refused to protect provider credentials",
             _ => "selected provider is unavailable or rejected the request",
         };
-        bail!("Jev returned HTTP {}: {hint}", status.as_u16());
+        return Err(anyhow!(DecisionTransportFailure::Http(status.as_u16()))
+            .context(format!("Jev returned HTTP {}: {hint}", status.as_u16())));
     }
     ensure!(
         !response
@@ -850,11 +744,9 @@ async fn read_response(
         "Jev response exceeds the bounded response size"
     );
     let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| anyhow!("Could not read Jev response"))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        anyhow!(DecisionTransportFailure::Network).context("Could not read Jev response")
+    })? {
         ensure!(
             bytes.len().saturating_add(chunk.len()) <= limit,
             "Jev response exceeds the bounded response size"
@@ -888,8 +780,6 @@ fn validate_answers(value: &Value, questions: &Map<String, Value>) -> Result<()>
                     .is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v)),
                 "Jev returned an invalid noul probability"
             );
-        } else if question["type"] == "choice" {
-            validate_choice_answer(question, answer)?;
         }
     }
     Ok(())
@@ -1038,11 +928,7 @@ mod tests {
                 .unwrap(),
             "aimlapi"
         );
-        for purpose in [
-            JevPurpose::Memory,
-            JevPurpose::Browser,
-            JevPurpose::Suggestions,
-        ] {
+        for purpose in [JevPurpose::Memory, JevPurpose::Browser] {
             assert!(
                 purpose
                     .selector_with(
@@ -1052,24 +938,6 @@ mod tests {
                     .is_err()
             );
         }
-        assert_eq!(
-            JevPurpose::Suggestions
-                .selector_with(
-                    |key| {
-                        assert_eq!(key, SUGGESTIONS_PROVIDER_ENV);
-                        Ok("   ".into())
-                    },
-                    || "laya".into(),
-                )
-                .unwrap(),
-            "laya"
-        );
-        assert_eq!(
-            JevPurpose::Suggestions
-                .selector_with(|_| Err(std::env::VarError::NotPresent), || "  ".into(),)
-                .unwrap(),
-            "auto"
-        );
     }
 
     #[test]
@@ -1142,14 +1010,6 @@ mod tests {
                 "typesafe.env",
                 "https://api.typesafe.ai/v1/systemone",
                 "jev-latest",
-            ),
-            (
-                "openjev",
-                JevProvider::OpenJev,
-                "OPENJEV_API_KEY",
-                "openjev.env",
-                "https://api.openjev.sh/v1/systemone",
-                "openjev",
             ),
             (
                 "laya",
@@ -1507,6 +1367,61 @@ mod tests {
     }
 
     #[test]
+    fn retry_and_hedge_transport_bodies_share_the_original_allocation() {
+        let original = vec![b'x'; 64 * 1024];
+        let original_ptr = original.as_ptr();
+        let wire = bytes::Bytes::from(original);
+        assert_eq!(wire.as_ptr(), original_ptr);
+        let attempts: Vec<_> = (0..16).map(|_| reqwest::Body::from(wire.clone())).collect();
+        for attempt in &attempts {
+            let payload = attempt.as_bytes().unwrap();
+            assert_eq!(payload.as_ptr(), original_ptr);
+            assert_eq!(payload.len(), 64 * 1024);
+        }
+        drop(wire);
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| { attempt.as_bytes().unwrap().iter().all(|byte| *byte == b'x') })
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_retry_body_preserves_every_large_request_byte() {
+        let (base, worker) = mock_server(vec![
+            (503, "overloaded".into(), vec![]),
+            (529, "overloaded".into(), vec![]),
+            (200, response().to_string(), vec![]),
+        ]);
+        let client = mock_client(&base, JevProvider::OpenRouter);
+        let original = request_body(
+            JevProvider::OpenRouter,
+            json!({"memory": "界\n🦀".repeat(8_000)}),
+            &questions(),
+        )
+        .unwrap();
+        assert!(original.len() > 64 * 1024);
+        assert!(original.len() <= MAX_REQUEST_BYTES);
+        let result = client
+            .send(&client.endpoint, original.clone())
+            .await
+            .unwrap();
+        assert!(validate_answers(&result, &questions()).is_ok());
+        let requests = worker.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(body.as_bytes(), original);
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-route-secret")
+            );
+            assert!(headers.contains("Jcode Memory"));
+        }
+    }
+
+    #[test]
     fn model_override_precedence_and_provider_defaults() {
         assert_eq!(
             resolve_model_override(Some(" custom/model ".into()), Some("config/model".into())),
@@ -1533,7 +1448,6 @@ mod tests {
             JevPurpose::Memory,
             JevProvider::OpenRouter,
             "typesafe/jev-1.14",
-            "",
             json!("query"),
             &questions(),
         )
@@ -1571,51 +1485,6 @@ mod tests {
         assert_eq!(worker.join().unwrap().len(), 1);
     }
 
-    #[tokio::test]
-    async fn voice_subscription_uses_existing_noul_entitlement_without_bypassing_it() {
-        for entitled in [false, true] {
-            let mut replies = vec![(
-                200,
-                json!({"capabilities": {"memory_jev": entitled, "browser_jev": false}}).to_string(),
-                vec![],
-            )];
-            if entitled {
-                replies.push((200, response().to_string(), vec![]));
-            }
-            let (base, worker) = mock_server(replies);
-            let mut client = mock_client(&base, JevProvider::Jcode);
-            client.purpose = JevPurpose::Voice;
-            let result = client
-                .evaluate(json!({"transcript": "synthetic"}), questions())
-                .await;
-            let requests = worker.join().unwrap();
-            assert!(requests[0].starts_with("GET /v1/me "));
-            if entitled {
-                result.unwrap();
-                assert_eq!(requests.len(), 2);
-                let body: Value =
-                    serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
-                assert_eq!(body["model"], "typesafe/jev-1.13");
-                assert!(body["state"].is_string());
-                assert!(
-                    !requests[1]
-                        .to_ascii_lowercase()
-                        .contains("x-jcode-jev-purpose"),
-                    "only browser decisions use the browser budget"
-                );
-            } else {
-                let error = result.unwrap_err().to_string();
-                assert!(error.contains("voice"));
-                assert!(error.contains("memory_jev"));
-                assert_eq!(
-                    requests.len(),
-                    1,
-                    "denied voice entitlement must not send a decision"
-                );
-            }
-        }
-    }
-
     /// Serve every connection on its own thread. Connection `n` waits
     /// `delays[n]` before replying, so a slow primary can overlap a hedge.
     pub(super) fn concurrent_mock(
@@ -1651,310 +1520,9 @@ mod tests {
         });
         (base, seen)
     }
-
-    #[tokio::test]
-    async fn voice_hedges_a_slow_request_and_takes_the_first_valid_answer() {
-        let (base, seen) =
-            concurrent_mock(vec![(Duration::from_secs(3), 200), (Duration::ZERO, 200)]);
-        let mut client = mock_client(&base, JevProvider::TypeSafe);
-        client.purpose = JevPurpose::Voice;
-        let started = std::time::Instant::now();
-        let value = client
-            .evaluate(json!({"transcript": "synthetic"}), questions())
-            .await
-            .unwrap();
-        assert!(validate_answers(&value, &questions()).is_ok());
-        assert!(started.elapsed() < Duration::from_secs(2), "hedge won");
-        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn voice_hedge_failure_waits_for_primary_and_memory_never_hedges() {
-        let (base, seen) = concurrent_mock(vec![
-            (Duration::from_millis(300), 200),
-            (Duration::ZERO, 500),
-        ]);
-        let mut client = mock_client(&base, JevProvider::TypeSafe);
-        client.purpose = JevPurpose::Voice;
-        client
-            .evaluate(json!({"transcript": "synthetic"}), questions())
-            .await
-            .unwrap();
-        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
-
-        let (base, seen) = concurrent_mock(vec![(Duration::from_millis(300), 200)]);
-        mock_client(&base, JevProvider::TypeSafe)
-            .evaluate(json!({"transcript": "synthetic"}), questions())
-            .await
-            .unwrap();
-        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn voice_typesafe_errors_never_retry_or_return_a_partial_report() {
-        for status in [401, 402, 403, 500, 302] {
-            let (base, worker) = mock_server(vec![(
-                status,
-                "private-error test-route-secret".into(),
-                vec![("Location".into(), "http://127.0.0.1:1/never-follow".into())],
-            )]);
-            let mut client = mock_client(&base, JevProvider::TypeSafe);
-            client.purpose = JevPurpose::Voice;
-            let error =
-                crate::voice_intent::classify_with_client("Start a new session", &[], &client)
-                    .await
-                    .unwrap_err()
-                    .to_string();
-            assert!(error.contains(&status.to_string()));
-            assert!(!error.contains("test-route-secret"));
-            assert!(!error.contains("private-error"));
-            assert_eq!(worker.join().unwrap().len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn voice_direct_transport_preserves_typed_state_and_never_sends_openrouter_headers() {
-        use crate::voice_intent::{
-            QuickAction, VoiceIntent, classify_with_client, describe_questions,
-        };
-        let transcript = "Start a new Jcode conversation";
-        let answers: Map<String, Value> = describe_questions(transcript, &[])
-            .unwrap()
-            .into_iter()
-            .map(|question| {
-                let probability = match question.id.as_str() {
-                    "quick_action" | "new_session" => 0.99,
-                    _ => 0.01,
-                };
-                (question.id, json!({"type": "noul", "noul": probability}))
-            })
-            .collect();
-        let (base, worker) =
-            mock_server(vec![(200, json!({"answers": answers}).to_string(), vec![])]);
-        let mut client = mock_client(&base, JevProvider::TypeSafe);
-        client.purpose = JevPurpose::Voice;
-        client.endpoint = format!("{base}/v1/systemone");
-        let report = classify_with_client(transcript, &[], &client)
-            .await
-            .unwrap();
-        assert_eq!(
-            report.intent,
-            VoiceIntent::QuickAction(QuickAction::NewSession)
-        );
-        let requests = worker.join().unwrap();
-        assert_eq!(
-            requests.len(),
-            1,
-            "direct API has no gateway entitlement preflight"
-        );
-        let request = &requests[0];
-        assert!(request.starts_with("POST /v1/systemone "));
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .contains("authorization: bearer test-route-secret\r\n")
-        );
-        assert!(!request.to_ascii_lowercase().contains("http-referer:"));
-        assert!(!request.to_ascii_lowercase().contains("x-title:"));
-        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(body["model"], "jev-latest");
-        assert_eq!(body["state"]["transcript"], transcript);
-        assert_eq!(body["questions"].as_object().unwrap().len(), 6);
-    }
-
-    #[tokio::test]
-    async fn voice_twenty_candidates_cross_real_transport_in_bounded_same_state_batches() {
-        use crate::voice_intent::{
-            SessionCandidate, VoiceIntent, classify_with_client, describe_questions,
-        };
-        let offered: Vec<_> = (0..20)
-            .map(|index| SessionCandidate {
-                id: format!("private-session-{index}"),
-                title: format!("Investigate voice routing request budgets and preserve classification safety for recent conversation {index}: compare candidate metadata, JSON escaping, provider transport limits, and regression coverage"),
-                working_dir: Some(r#"C:\Users\example\projects\jcode\"voice routing""#.into()),
-            })
-            .collect();
-        let transcript = "Open conversation 19";
-        let questions = describe_questions(transcript, &offered).unwrap();
-        assert_eq!(questions.len(), 26);
-        // Exercise both object-state and string-state providers, including the
-        // gateway's real entitlement preflight on every bounded evaluation.
-        for provider in [
-            JevProvider::TypeSafe,
-            JevProvider::OpenRouter,
-            JevProvider::Aimlapi,
-            JevProvider::Jcode,
-        ] {
-            // All batches participate in ranking, with no competing-score veto.
-            for competing in [0.01, 0.9, 0.99, 1.0] {
-                let batches = questions.chunks(provider.max_questions()).count();
-                let per_batch = if provider == JevProvider::Jcode { 2 } else { 1 };
-                // Batches run concurrently, so answer whatever each request asks.
-                let (base, worker) = mock_server_with(batches * per_batch, move |request| {
-                    if request.starts_with("GET ") {
-                        let me = json!({"capabilities": {"memory_jev": true}});
-                        return (200, me.to_string(), vec![]);
-                    }
-                    let body: Value =
-                        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-                    let answers: Map<String, Value> = body["questions"]
-                        .as_object()
-                        .unwrap()
-                        .keys()
-                        .map(|id| {
-                            let probability = match id.as_str() {
-                                "navigation" | "candidate_19" => 0.99,
-                                "coding_agent" => competing,
-                                _ => 0.01,
-                            };
-                            (id.clone(), json!({"type": "noul", "noul": probability}))
-                        })
-                        .collect();
-                    (200, json!({"answers": answers}).to_string(), vec![])
-                });
-                let result =
-                    classify_with_client(transcript, &offered, &mock_client(&base, provider))
-                        .await
-                        .unwrap();
-                assert_eq!(
-                    result.intent,
-                    if competing < 0.99 {
-                        VoiceIntent::OpenSession(offered[19].id.clone())
-                    } else {
-                        VoiceIntent::CodingAgent
-                    }
-                );
-                assert_eq!(result.answers.len(), 26);
-                assert_eq!(
-                    result.answers.iter().map(|a| &a.id).collect::<Vec<_>>(),
-                    questions.iter().map(|q| &q.id).collect::<Vec<_>>()
-                );
-                assert_eq!(
-                    result
-                        .answers
-                        .iter()
-                        .find(|a| a.id == "candidate_19")
-                        .unwrap()
-                        .probability,
-                    0.99
-                );
-                let requests = worker.join().unwrap();
-                let bodies: Vec<Value> = requests
-                    .iter()
-                    .filter(|r| r.starts_with("POST "))
-                    .map(|r| {
-                        let wire = r.split_once("\r\n\r\n").unwrap().1;
-                        assert!(wire.len() <= MAX_REQUEST_BYTES);
-                        assert!(wire.len() < 32 * 1024, "voice batch bytes: {}", wire.len());
-                        serde_json::from_str(wire).unwrap()
-                    })
-                    .collect();
-                assert_eq!(bodies.len(), batches);
-                assert!(
-                    bodies
-                        .iter()
-                        .all(|body| body["state"] == bodies[0]["state"])
-                );
-                let state = if let Some(text) = bodies[0]["state"].as_str() {
-                    serde_json::from_str::<Value>(text).unwrap()
-                } else {
-                    bodies[0]["state"].clone()
-                };
-                assert_eq!(state["candidates"].as_object().unwrap().len(), 20);
-                assert_eq!(state["transcript"], transcript);
-                assert!(
-                    state["policy"]
-                        .as_str()
-                        .unwrap()
-                        .contains("untrusted evidence")
-                );
-                for (index, candidate) in offered.iter().enumerate() {
-                    assert_eq!(
-                        state["candidates"][format!("candidate_{index}")]["title"],
-                        candidate.title
-                    );
-                    assert_eq!(
-                        state["candidates"][format!("candidate_{index}")]["working_dir"],
-                        candidate.working_dir.as_deref().unwrap()
-                    );
-                }
-                assert!(!state.to_string().contains("private-session"));
-                let mut sent = Map::new();
-                for body in &bodies {
-                    let batch = body["questions"].as_object().unwrap();
-                    assert!(batch.len() <= provider.max_questions());
-                    sent.extend(batch.clone());
-                }
-                assert_eq!(sent.len(), questions.len());
-                for question in &questions {
-                    assert_eq!(sent[&question.id]["instructions"], question.instructions);
-                    assert_eq!(sent[&question.id]["criteria"]["true"], question.yes);
-                    assert_eq!(sent[&question.id]["criteria"]["false"], question.no);
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn voice_later_batch_errors_never_return_partial_classification() {
-        use crate::voice_intent::{SessionCandidate, classify_with_client, describe_questions};
-        let offered: Vec<_> = (0..20)
-            .map(|index| SessionCandidate {
-                id: format!("session-{index}"),
-                title: format!("Conversation {index}"),
-                working_dir: None,
-            })
-            .collect();
-        let questions = describe_questions("next conversation", &offered).unwrap();
-        let first: Map<String, Value> = questions[..MAX_QUESTIONS].iter().map(|q| (q.id.clone(), json!({"type": "noul", "noul": if q.id == "coding_agent" { 0.99 } else { 0.01 }}))).collect();
-        let last: Map<String, Value> = questions[MAX_QUESTIONS..]
-            .iter()
-            .map(|q| (q.id.clone(), json!({"type": "noul", "noul": 0.01})))
-            .collect();
-        let mut failures = vec![
-            (500, "{}".into(), vec![]),
-            (200, json!({"answers": {}}).to_string(), vec![]),
-        ];
-        for invalid in [
-            json!({"type": "noul", "noul": 1.1}),
-            json!({"type": "noul", "noul": "0.99"}),
-            json!({"type": "choice", "choice": "yes"}),
-        ] {
-            let mut bad = last.clone();
-            bad.insert(questions[MAX_QUESTIONS].id.clone(), invalid);
-            failures.push((200, json!({"answers": bad}).to_string(), vec![]));
-        }
-        let mut wrong_ids = last.clone();
-        wrong_ids.remove(&questions[MAX_QUESTIONS].id);
-        wrong_ids.insert("invented".into(), json!({"type": "noul", "noul": 0.99}));
-        failures.push((200, json!({"answers": wrong_ids}).to_string(), vec![]));
-        for failure in failures {
-            // Batches run concurrently, so reply by which batch was requested.
-            let later = questions[MAX_QUESTIONS].id.clone();
-            let good = json!({"answers": first}).to_string();
-            let mut failure = Some(failure);
-            let (base, worker) = mock_server_with(2, move |request| {
-                let body: Value =
-                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-                if body["questions"].get(&later).is_some() {
-                    failure.take().unwrap()
-                } else {
-                    (200, good.clone(), vec![])
-                }
-            });
-            assert!(
-                classify_with_client(
-                    "next conversation",
-                    &offered,
-                    &mock_client(&base, JevProvider::OpenRouter)
-                )
-                .await
-                .is_err()
-            );
-            assert_eq!(worker.join().unwrap().len(), 2);
-        }
-    }
 }
 
 #[cfg(test)]
 mod transport_tests;
+#[cfg(test)]
+mod voice_tests;

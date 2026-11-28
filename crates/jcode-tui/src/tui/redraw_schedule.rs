@@ -20,6 +20,33 @@ pub(crate) const REDRAW_PASSIVE_LIVENESS: Duration = Duration::from_millis(1000)
 /// Tick cadence while a drag-held edge autoscroll runs (one line per tick).
 pub(crate) const REDRAW_COPY_AUTOSCROLL: Duration = Duration::from_millis(30);
 pub(crate) const REDRAW_DEEP_IDLE_AFTER: Duration = Duration::from_secs(30);
+/// Tick cadence while a turn is live but its streamed text is fully revealed.
+/// Matches the status spinner glyph cadence so the spinner stays smooth.
+pub(crate) const REDRAW_STATIC_STREAM: Duration = Duration::from_millis(80);
+/// Fastest tick for a client whose terminal is not focused. Nobody is looking
+/// closely at a background pane, but agent swarms keep a dozen of them
+/// streaming at once, so full-rate repaints there are pure battery cost.
+pub(crate) const REDRAW_UNFOCUSED_MIN: Duration = Duration::from_millis(100);
+/// Text batching rate for an unfocused client that is streaming a reply. Each
+/// batch is a full frame, so this is the expensive part of a mirrored working
+/// window: at 100ms it measured 10 full frames/s and about 9% of a core. The
+/// spinner does not depend on this rate, it is repainted as a single cell on
+/// its own 80ms clock (see `status_spinner_only_symbol`).
+pub(crate) const REDRAW_UNFOCUSED_STREAM: Duration = Duration::from_millis(250);
+/// Tick and text batching rate for an unfocused client whose window is known
+/// to be out of sight (see `window_visibility`). Nothing it paints is seen, so
+/// it only keeps its state current for the moment it is shown again.
+pub(crate) const REDRAW_HIDDEN: Duration = Duration::from_secs(1);
+
+/// How long an unfocused client leaves the server socket alone between text
+/// batches.
+pub(crate) fn unfocused_event_hold(focused: bool) -> Duration {
+    if crate::tui::window_visibility::hidden(focused) {
+        REDRAW_HIDDEN
+    } else {
+        REDRAW_UNFOCUSED_STREAM
+    }
+}
 
 /// Whether this session has been left alone long enough to be treated as
 /// dormant (deep idle): no stream activity *and* no user interaction for
@@ -268,7 +295,6 @@ fn primary_status_spinner_fast_path_available_with_policy(
         && !state.centered_mode()
         && !state.has_pending_mouse_scroll_animation()
         && !state.remote_startup_phase_active()
-        && !state.explorer_countdown_active()
 }
 
 fn primary_status_spinner_needs_full_redraw_with_policy(
@@ -301,6 +327,10 @@ pub(crate) const REDRAW_SWARM_SPINNER: Duration =
 /// happens to arrive. Unfocused clients skip this so backgrounded windows do
 /// not burn CPU animating a glyph nobody can see; terminal statuses render
 /// fixed glyphs and need no animation frames.
+fn todo_completion_age_redraw_active(state: &dyn TuiState) -> bool {
+    state.client_focused() && ui::todo_completion_flash::age_update_due(state.now_millis())
+}
+
 fn swarm_spinner_redraw_active(state: &dyn TuiState) -> bool {
     state.client_focused()
         && state
@@ -411,6 +441,36 @@ pub(crate) fn redraw_interval_with_policy_and_animation(
     policy: &crate::perf::TuiPerfPolicy,
     animation_on_screen: bool,
 ) -> Duration {
+    let interval = redraw_interval_focused_policy(state, policy, animation_on_screen);
+    if state.client_focused() || state.copy_selection_edge_autoscroll_active() {
+        interval
+    } else {
+        interval.max(unfocused_redraw_min(state))
+    }
+}
+
+/// Fastest tick for an unfocused client. A scroll animation keeps
+/// [`REDRAW_UNFOCUSED_MIN`]. Text that is still being revealed is batched at
+/// [`REDRAW_UNFOCUSED_STREAM`], so a visible tiled pane still shows live output. A background turn that is only thinking or
+/// running a tool has nothing but a spinner and timer to move, so it ticks at
+/// the passive liveness rate: measured 10 full frames/s per such session before.
+fn unfocused_redraw_min(state: &dyn TuiState) -> Duration {
+    if crate::tui::window_visibility::hidden(state.client_focused()) {
+        REDRAW_HIDDEN.max(REDRAW_PASSIVE_LIVENESS)
+    } else if state.has_pending_mouse_scroll_animation() {
+        REDRAW_UNFOCUSED_MIN
+    } else if state.stream_reveal_pending() {
+        REDRAW_UNFOCUSED_STREAM
+    } else {
+        REDRAW_PASSIVE_LIVENESS
+    }
+}
+
+fn redraw_interval_focused_policy(
+    state: &dyn TuiState,
+    policy: &crate::perf::TuiPerfPolicy,
+    animation_on_screen: bool,
+) -> Duration {
     let animation_interval = fps_to_duration(policy.animation_fps);
     let fast_interval = fps_to_duration(policy.redraw_fps);
 
@@ -436,10 +496,6 @@ pub(crate) fn redraw_interval_with_policy_and_animation(
         return REDRAW_COPY_AUTOSCROLL;
     }
 
-    if state.explorer_countdown_active() {
-        return REDRAW_IDLE;
-    }
-
     // While the terminal is backgrounded (FocusLost), an idle session has nothing
     // worth a fast tick: decorative animations are paused and the run loop only
     // repaints throttled idle frames. Use the slow deep-idle interval so the
@@ -451,7 +507,6 @@ pub(crate) fn redraw_interval_with_policy_and_animation(
         && !state.has_pending_mouse_scroll_animation()
         && !state.copy_selection_edge_autoscroll_active()
         && !state.remote_startup_phase_active()
-        && !state.explorer_countdown_active()
         && !rate_limit_countdown_redraw_active(state)
         && crate::build::read_build_progress().is_none()
     {
@@ -466,14 +521,20 @@ pub(crate) fn redraw_interval_with_policy_and_animation(
         && !state.has_pending_mouse_scroll_animation()
         && !state.copy_selection_edge_autoscroll_active()
         && !state.remote_startup_phase_active()
-        && !state.explorer_countdown_active()
         && !rate_limit_countdown_redraw_active(state)
         && !cache_cold_countdown_redraw_active(state)
         && state.openai_reset_hint().is_none()
         && crate::build::read_build_progress().is_none()
         && !swarm_spinner_redraw_active(state)
         && !session_picker_spinner_redraw_active(state)
+        && !todo_completion_age_redraw_active(state)
     {
+        if state.client_focused()
+            && let Some(rem) = ui::todo_completion_flash::age_update_remaining(state.now_millis())
+            && rem < REDRAW_DEEP_IDLE
+        {
+            return rem.max(REDRAW_IDLE);
+        }
         return REDRAW_DEEP_IDLE;
     }
 
@@ -532,6 +593,24 @@ pub(crate) fn redraw_interval_with_policy_and_animation(
         && (state.is_processing() || rate_limit_countdown_redraw_active(state))
     {
         return REDRAW_PASSIVE_LIVENESS;
+    }
+
+    // Streamed text is on screen but fully revealed while the turn continues
+    // (thinking or running a tool after emitting text). New deltas wake the
+    // loop themselves, so ticks only need to keep the status spinner and timer
+    // alive. Measured on a live client: this state held 66 full frames/s with
+    // zero changed cells, about 0.2 cores per waiting session.
+    if state.is_processing()
+        && !state.streaming_text().is_empty()
+        && !state.stream_reveal_pending()
+        && !state.has_pending_mouse_scroll_animation()
+        && !state.copy_selection_edge_autoscroll_active()
+        && !rate_limit_countdown_redraw_active(state)
+    {
+        return match policy.tier {
+            crate::perf::PerformanceTier::Minimal => REDRAW_IDLE,
+            _ => REDRAW_STATIC_STREAM,
+        };
     }
 
     if state.is_processing()
@@ -615,13 +694,13 @@ fn periodic_redraw_required_inner(state: &dyn TuiState, include_idle_animation: 
         && !state.has_pending_mouse_scroll_animation()
         && !state.copy_selection_edge_autoscroll_active()
         && !state.remote_startup_phase_active()
-        && !state.explorer_countdown_active()
         && !rate_limit_countdown_redraw_active(state)
         && !cache_cold_countdown_redraw_active(state)
         && state.openai_reset_hint().is_none()
         && crate::build::read_build_progress().is_none()
         && !swarm_spinner_redraw_active(state)
         && !session_picker_spinner_redraw_active(state)
+        && !todo_completion_age_redraw_active(state)
     {
         return false;
     }
@@ -644,6 +723,11 @@ fn periodic_redraw_required_inner(state: &dyn TuiState, include_idle_animation: 
 
     if session_picker_spinner_redraw_active(state) {
         record_full_frame_redraw_reason("session_picker_spinner");
+        return true;
+    }
+
+    if todo_completion_age_redraw_active(state) {
+        record_full_frame_redraw_reason("todo_completion_age");
         return true;
     }
 
@@ -692,9 +776,6 @@ fn live_activity_redraw_reason(state: &dyn TuiState) -> Option<&'static str> {
     }
     if state.remote_startup_phase_active() {
         return Some("remote_startup");
-    }
-    if state.explorer_countdown_active() {
-        return Some("explorer_countdown");
     }
     None
 }

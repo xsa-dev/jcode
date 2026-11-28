@@ -414,6 +414,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         crash_on_disconnect: true,
         continue_on_disconnect: true,
         terminal_env: vec![("ZELLIJ_SESSION_NAME".to_string(), "sessionB".to_string())],
+        client_name: None,
     };
     let json = serde_json::to_string(&req)?;
     assert!(json.contains("\"type\":\"subscribe\""));
@@ -435,6 +436,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         crash_on_disconnect,
         continue_on_disconnect,
         terminal_env,
+        client_name: _,
     } = decoded
     else {
         return Err(anyhow!("expected Subscribe"));
@@ -478,6 +480,7 @@ fn test_subscribe_request_defaults_optional_flags() -> Result<()> {
         crash_on_disconnect,
         continue_on_disconnect,
         terminal_env,
+        client_name: _,
     } = decoded
     else {
         return Err(anyhow!("expected Subscribe"));
@@ -507,6 +510,7 @@ fn test_resume_session_defaults_sync_flags() -> Result<()> {
         client_instance_id,
         client_has_local_history,
         allow_session_takeover,
+        client_name: _,
     } = decoded
     else {
         return Err(anyhow!("expected ResumeSession"));
@@ -566,6 +570,7 @@ fn test_resume_all_result_event_roundtrip() -> Result<()> {
 fn test_message_request_roundtrip_preserves_images_and_system_reminder() -> Result<()> {
     let req = Request::Message {
         id: 88,
+        jarvis_voice: false,
         content: "inspect this".to_string(),
         images: vec![
             ("image/png".to_string(), "AAA".to_string()),
@@ -579,11 +584,13 @@ fn test_message_request_roundtrip_preserves_images_and_system_reminder() -> Resu
     let decoded = parse_request_json(&json)?;
     let Request::Message {
         id,
+        jarvis_voice: false,
         content,
         images,
         system_reminder,
         active_skill,
         no_reply,
+        ..
     } = decoded
     else {
         return Err(anyhow!("expected Message"));
@@ -752,4 +759,23 @@ fn context_cap_wire_roundtrip() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[test]
+fn subscribe_and_resume_client_name_is_optional_and_compatible() {
+    let old: Request = serde_json::from_str(r#"{"type":"subscribe","id":1}"#).unwrap();
+    assert!(matches!(old, Request::Subscribe { client_name: None, .. }));
+    let new: Request =
+        serde_json::from_str(r#"{"type":"subscribe","id":1,"client_name":"jcode-ios/1.0"}"#)
+            .unwrap();
+    assert!(
+        matches!(new, Request::Subscribe { client_name: Some(ref n), .. } if n == "jcode-ios/1.0")
+    );
+    let resume: Request = serde_json::from_str(
+        r#"{"type":"resume_session","id":2,"session_id":"s","client_name":"jcode-ios/1.0"}"#,
+    )
+    .unwrap();
+    assert!(matches!(resume, Request::ResumeSession { client_name: Some(_), .. }));
+    let json = serde_json::to_string(&old).unwrap();
+    assert!(!json.contains("client_name"));
 }

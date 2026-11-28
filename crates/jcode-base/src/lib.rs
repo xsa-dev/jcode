@@ -54,6 +54,7 @@ pub mod hooks;
 pub mod id;
 pub mod image_normalize;
 pub mod import;
+pub mod inherited_children;
 pub mod jev;
 pub mod kv_cache_monitor;
 pub mod live_tests;
@@ -103,7 +104,6 @@ pub mod storage;
 pub mod subscription_api;
 pub mod subscription_catalog;
 pub mod subscription_notice;
-pub mod suggested_replies;
 pub mod telegram;
 pub mod telemetry {
     pub use jcode_telemetry_core::*;

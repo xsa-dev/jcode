@@ -1,57 +1,3 @@
-/// Regression: the completion-gate circuit breaker clears
-/// `auto_poke_incomplete_todos`, and the only restore used to live in the
-/// all-complete branch. Since the breaker can only trip while every todo is
-/// complete, an agent that added open work immediately afterwards left
-/// auto-poke disarmed for the rest of the session, and the guard at the top
-/// of `schedule_auto_poke_followup_if_needed` returned false immediately.
-#[test]
-fn test_open_work_rearms_auto_poke_after_completion_gate_breaker() {
-    with_temp_jcode_home(|| {
-        let mut app = create_test_app();
-
-        crate::todo::save_todos(
-            &app.session.id,
-            &[crate::todo::TodoItem {
-                lane_after: None,
-                stage: None,
-                details: None,
-                group: None,
-                id: "open".to_string(),
-                content: "Still open".to_string(),
-                status: "in_progress".to_string(),
-                priority: "high".to_string(),
-                blocked_by: Vec::new(),
-                assigned_to: None,
-                confidence: None,
-                completion_confidence: None,
-                confidence_history: Vec::new(),
-                external_blocker: None,
-                completely_blocked: None,
-                waiting_on: Vec::new(),
-            }],
-        )
-        .expect("save todos");
-
-        // The exact state the circuit breaker leaves behind: flag cleared,
-        // configured default still on, nothing else touched.
-        app.auto_poke_default_on = true;
-        app.auto_poke_incomplete_todos = false;
-        app.last_auto_poke_fingerprint = None;
-        app.final_response_todo_fingerprint = None;
-        app.todo_final_response_requested = false;
-        app.pending_queued_dispatch = false;
-        app.pending_turn = false;
-
-        let poked = app.schedule_auto_poke_followup_if_needed();
-
-        assert!(
-            app.auto_poke_incomplete_todos,
-            "open work must re-arm auto-poke after the completion-gate breaker"
-        );
-        assert!(poked, "open work must still produce a poke");
-    });
-}
-
 include!("model_picker_startup_tests.rs");
 
 #[test]
@@ -63,6 +9,7 @@ fn test_cloud_handoff_defers_turn_end_auto_poke_without_disarming_it() {
                 &app.session.id,
                 &[crate::todo::TodoItem {
                     lane_after: None,
+                    lane_owner: None,
                     stage: None,
                     details: None,
                     group: None,
@@ -75,8 +22,8 @@ fn test_cloud_handoff_defers_turn_end_auto_poke_without_disarming_it() {
                     confidence: None,
                     completion_confidence: None,
                     confidence_history: Vec::new(),
-                    external_blocker: None,
-                    completely_blocked: None,
+                    waiting_reason: None,
+                    requires_user_auth: None,
                     waiting_on: Vec::new(),
                 }],
             )
@@ -842,18 +789,7 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
         .content
         .clone();
     assert!(prompt.contains("Cerebras API Key"), "{prompt}");
-    assert!(
-        prompt.contains("Stored variable: CEREBRAS_API_KEY"),
-        "{prompt}"
-    );
-    assert!(
-        prompt.contains("Endpoint: https://api.cerebras.ai/v1"),
-        "{prompt}"
-    );
-    assert!(
-        prompt.contains("Suggested default model: gpt-oss-120b"),
-        "{prompt}"
-    );
+    assert!(prompt.contains("Default model: gpt-oss-120b"), "{prompt}");
     assert!(prompt.contains("Paste your API key below"), "{prompt}");
 
     let pending = app
@@ -887,11 +823,9 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
                         .unwrap()
                         .join("cerebras.env");
                     assert!(
-                        login
-                            .message
-                            .contains(&format!("Stored at {}.", expected_path.display())),
-                        "{}",
-                        login.message
+                        expected_path.exists(),
+                        "expected saved key file at {}",
+                        expected_path.display()
                     );
                     assert!(login.message.contains("Fetching models now."));
                     assert!(!login.message.contains("did not switch models"));
@@ -2239,10 +2173,12 @@ fn test_login_preview_enter_after_navigation_starts_selected_login() {
         .filtered
         .iter()
         .position(|&index| {
-            matches!(&picker.entries[index].action, crate::tui::PickerAction::Login(provider)
-                if provider.id == "anthropic-api")
+            matches!(
+                &picker.entries[index].action,
+                crate::tui::PickerAction::AutoApiKey
+            )
         })
-        .expect("Anthropic API key login should be listed");
+        .expect("Paste an API key login should be listed in starter view");
     for _ in 0..target {
         app.handle_key(KeyCode::Down, KeyModifiers::empty())
             .unwrap();
@@ -2257,6 +2193,131 @@ fn test_login_preview_enter_after_navigation_starts_selected_login() {
     assert!(
         app.pending_login.is_some(),
         "selected provider login flow should start"
+    );
+}
+
+#[test]
+fn test_login_picker_starts_collapsed_with_more_providers_and_expands_on_enter() {
+    let mut app = create_test_app();
+    app.open_login_picker_inline();
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("login picker should be open");
+    assert_eq!(picker.kind, crate::tui::PickerKind::Login);
+    // Starter view should stay compact (<= 7 rows, never pushed below the fold
+    // by saved accounts or other configured providers) and end with
+    // "More providers (N)…".
+    assert!(
+        picker.filtered.len() <= 7,
+        "starter list should stay compact (<= 7 rows), got {}",
+        picker.filtered.len()
+    );
+    assert!(
+        picker.filtered.len() < picker.entries.len(),
+        "starter list ({}) should be shorter than full catalog ({})",
+        picker.filtered.len(),
+        picker.entries.len()
+    );
+    let expand_pos = picker
+        .filtered
+        .iter()
+        .position(|&index| {
+            matches!(
+                picker.entries[index].action,
+                crate::tui::PickerAction::ExpandLoginProviders
+            )
+        })
+        .expect("More providers expand row should be visible in starter view");
+    assert!(
+        picker.filtered.iter().any(|&i| matches!(
+            picker.entries[i].action,
+            crate::tui::PickerAction::AutoApiKey
+        )),
+        "Paste an API key should be in starter view"
+    );
+    let starter_names: Vec<&str> = picker
+        .filtered
+        .iter()
+        .map(|&i| picker.entries[i].name.as_str())
+        .collect();
+    assert_eq!(
+        &starter_names[..5],
+        &[
+            "OpenAI",
+            "Anthropic/Claude",
+            "Google (Antigravity)",
+            "Paste an API key",
+            "Auto Import",
+        ],
+        "starter view should list OpenAI, Anthropic/Claude, Google (Antigravity), Paste an API key, Auto Import first; got {:?}",
+        starter_names
+    );
+    assert!(
+        !starter_names.contains(&"GitHub Copilot"),
+        "GitHub Copilot should be collapsed under More providers"
+    );
+    assert!(
+        !picker
+            .filtered
+            .iter()
+            .any(|&i| picker.entries[i].name == "Z.AI"),
+        "non-starter unconfigured provider should be collapsed by default"
+    );
+
+    // Typing a filter immediately searches hidden providers without expanding.
+    for ch in "z.ai".chars() {
+        app.handle_key(KeyCode::Char(ch), KeyModifiers::empty())
+            .unwrap();
+    }
+    let picker = app.inline_interactive_state.as_ref().unwrap();
+    assert!(
+        picker
+            .filtered
+            .iter()
+            .any(|&i| picker.entries[i].name == "Z.AI"),
+        "typing filter should immediately surface hidden providers like Z.AI"
+    );
+    assert!(
+        !picker.filtered.iter().any(|&i| matches!(
+            picker.entries[i].action,
+            crate::tui::PickerAction::ExpandLoginProviders
+        )),
+        "More providers expand row should not clutter filtered search results"
+    );
+    for _ in 0.."z.ai".len() {
+        app.handle_key(KeyCode::Backspace, KeyModifiers::empty())
+            .unwrap();
+    }
+
+    // Clearing the filter returns to the collapsed starter list, and pressing
+    // Enter on "More providers" expands in place without closing picker.
+    for _ in 0..expand_pos {
+        app.handle_key(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+    }
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("expanding More providers should keep login picker open");
+    assert_eq!(picker.filtered.len(), picker.entries.len());
+    assert!(
+        picker
+            .filtered
+            .iter()
+            .any(|&i| picker.entries[i].name == "Z.AI"),
+        "expanded login picker should reveal hidden providers like Z.AI"
+    );
+    assert!(
+        !picker
+            .entries
+            .iter()
+            .any(|e| matches!(e.action, crate::tui::PickerAction::ExpandLoginProviders)),
+        "ExpandLoginProviders row should be removed once expanded"
     );
 }
 
@@ -2341,6 +2402,7 @@ fn test_poke_arms_auto_poke_until_todos_are_done() {
             &app.session.id,
             &[crate::todo::TodoItem {
                 lane_after: None,
+                lane_owner: None,
                 stage: None,
                 details: None,
                 group: None,
@@ -2353,8 +2415,8 @@ fn test_poke_arms_auto_poke_until_todos_are_done() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
-                external_blocker: None,
-                completely_blocked: None,
+                waiting_reason: None,
+                requires_user_auth: None,
                 waiting_on: Vec::new(),
             }],
         )
@@ -2380,6 +2442,7 @@ fn test_poke_status_reports_current_state() {
             &app.session.id,
             &[crate::todo::TodoItem {
                 lane_after: None,
+                lane_owner: None,
                 stage: None,
                 details: None,
                 group: None,
@@ -2392,8 +2455,8 @@ fn test_poke_status_reports_current_state() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
-                external_blocker: None,
-                completely_blocked: None,
+                waiting_reason: None,
+                requires_user_auth: None,
                 waiting_on: Vec::new(),
             }],
         )
@@ -2440,6 +2503,7 @@ fn test_poke_off_disarms_and_clears_queued_followup() {
             &app.session.id,
             &[crate::todo::TodoItem {
                 lane_after: None,
+                lane_owner: None,
                 stage: None,
                 details: None,
                 group: None,
@@ -2452,8 +2516,8 @@ fn test_poke_off_disarms_and_clears_queued_followup() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
-                external_blocker: None,
-                completely_blocked: None,
+                waiting_reason: None,
+                requires_user_auth: None,
                 waiting_on: Vec::new(),
             }],
         )
@@ -2495,6 +2559,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
             &app.session.id,
             &[crate::todo::TodoItem {
                 lane_after: None,
+                lane_owner: None,
                 stage: None,
                 details: None,
                 group: None,
@@ -2507,8 +2572,8 @@ fn test_poke_queues_when_turn_is_in_progress() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
-                external_blocker: None,
-                completely_blocked: None,
+                waiting_reason: None,
+                requires_user_auth: None,
                 waiting_on: Vec::new(),
             }],
         )
@@ -2537,6 +2602,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
             &[
                 crate::todo::TodoItem {
                     lane_after: None,
+                    lane_owner: None,
                     stage: None,
                     details: None,
                     group: None,
@@ -2549,12 +2615,13 @@ fn test_poke_queues_when_turn_is_in_progress() {
                     confidence: None,
                     completion_confidence: None,
                     confidence_history: Vec::new(),
-                    external_blocker: None,
-                    completely_blocked: None,
+                    waiting_reason: None,
+                    requires_user_auth: None,
                     waiting_on: Vec::new(),
                 },
                 crate::todo::TodoItem {
                     lane_after: None,
+                    lane_owner: None,
                     stage: None,
                     details: None,
                     group: None,
@@ -2567,8 +2634,8 @@ fn test_poke_queues_when_turn_is_in_progress() {
                     confidence: None,
                     completion_confidence: None,
                     confidence_history: Vec::new(),
-                    external_blocker: None,
-                    completely_blocked: None,
+                    waiting_reason: None,
+                    requires_user_auth: None,
                     waiting_on: Vec::new(),
                 },
             ],
@@ -2614,6 +2681,7 @@ fn test_finish_turn_auto_pokes_again_when_todos_remain() {
             &app.session.id,
             &[crate::todo::TodoItem {
                 lane_after: None,
+                lane_owner: None,
                 stage: None,
                 details: None,
                 group: None,
@@ -2626,8 +2694,8 @@ fn test_finish_turn_auto_pokes_again_when_todos_remain() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
-                external_blocker: None,
-                completely_blocked: None,
+                waiting_reason: None,
+                requires_user_auth: None,
                 waiting_on: Vec::new(),
             }],
         )
@@ -2646,12 +2714,14 @@ fn test_finish_turn_auto_pokes_again_when_todos_remain() {
 #[test]
 fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
     with_temp_jcode_home(|| {
+        write_test_config("[features]\ntodo_gate_digest = true\n");
         let mut app = create_test_app();
         crate::todo::save_todos(
             &app.session.id,
             &[
                 crate::todo::TodoItem {
                     lane_after: None,
+                    lane_owner: None,
                     stage: None,
                     details: None,
                     group: None,
@@ -2661,17 +2731,16 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
                     priority: "high".to_string(),
                     blocked_by: Vec::new(),
                     assigned_to: None,
-                    confidence: Some(crate::todo::ConfidenceState::from_legacy_score(70)),
-                    completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(
-                        80,
-                    )),
+                    confidence: Some(crate::todo::ConfidenceState::Plausible),
+                    completion_confidence: Some(crate::todo::ConfidenceState::Plausible),
                     confidence_history: Vec::new(),
-                    external_blocker: None,
-                    completely_blocked: None,
+                    waiting_reason: None,
+                    requires_user_auth: None,
                     waiting_on: Vec::new(),
                 },
                 crate::todo::TodoItem {
                     lane_after: None,
+                    lane_owner: None,
                     stage: None,
                     details: None,
                     group: None,
@@ -2681,13 +2750,11 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
                     priority: "medium".to_string(),
                     blocked_by: Vec::new(),
                     assigned_to: None,
-                    confidence: Some(crate::todo::ConfidenceState::from_legacy_score(90)),
-                    completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(
-                        95,
-                    )),
+                    confidence: Some(crate::todo::ConfidenceState::Plausible),
+                    completion_confidence: Some(crate::todo::ConfidenceState::Plausible),
                     confidence_history: Vec::new(),
-                    external_blocker: None,
-                    completely_blocked: None,
+                    waiting_reason: None,
+                    requires_user_auth: None,
                     waiting_on: Vec::new(),
                 },
             ],
@@ -2697,7 +2764,7 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         crate::todo::save_goals(
             &app.session.id,
             &[crate::todo::TodoGoal {
-                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+                delivery_state: Some(crate::todo::DeliveryState::Delivered),
                 autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
                 iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
                 closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
@@ -2751,7 +2818,7 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         // todo tool, the next completion check requests one clean final answer.
         let mut validated = crate::todo::load_todos(&app.session.id).expect("load todos");
         for todo in &mut validated {
-            todo.completion_confidence = Some(crate::todo::ConfidenceState::from_legacy_score(100));
+            todo.completion_confidence = Some(crate::todo::ConfidenceState::Verified);
             todo.confidence_history = match todo.id.as_str() {
                 "todo-1" => vec![
                     crate::todo::ConfidenceState::Speculative,
@@ -2800,19 +2867,22 @@ fn test_todo_completion_gate_detects_abrupt_confidence_increase() {
     let summary = super::commands::todo_confidence_summary(&[crate::todo::TodoItem {
         status: "completed".to_string(),
         priority: "high".to_string(),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(0)),
-        completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-        external_blocker: None,
-        completely_blocked: None,
+        confidence: Some(crate::todo::ConfidenceState::Speculative),
+        completion_confidence: Some(crate::todo::ConfidenceState::Verified),
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         confidence_history: vec![
-            crate::todo::ConfidenceState::from_legacy_score(0),
-            crate::todo::ConfidenceState::from_legacy_score(100),
+            crate::todo::ConfidenceState::Speculative,
+            crate::todo::ConfidenceState::Verified,
         ],
         ..Default::default()
     }]);
 
-    assert_eq!(summary.completion_average, Some(100));
+    assert_eq!(
+        summary.completion_average,
+        Some(crate::todo::ConfidenceState::Verified)
+    );
     assert!(!summary.completion_confidence_needs_validation);
     assert!(summary.confidence_spike_detected);
     assert!(summary.needs_more_work);
@@ -2823,10 +2893,10 @@ fn test_todo_completion_gate_allows_evidence_backed_confidence_steps() {
     let summary = super::commands::todo_confidence_summary(&[crate::todo::TodoItem {
         status: "completed".to_string(),
         priority: "high".to_string(),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-        completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-        external_blocker: None,
-        completely_blocked: None,
+        confidence: Some(crate::todo::ConfidenceState::Verified),
+        completion_confidence: Some(crate::todo::ConfidenceState::Verified),
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         confidence_history: vec![
             crate::todo::ConfidenceState::Speculative,
@@ -2837,7 +2907,10 @@ fn test_todo_completion_gate_allows_evidence_backed_confidence_steps() {
         ..Default::default()
     }]);
 
-    assert_eq!(summary.completion_average, Some(100));
+    assert_eq!(
+        summary.completion_average,
+        Some(crate::todo::ConfidenceState::Verified)
+    );
     assert!(!summary.completion_confidence_needs_validation);
     assert!(!summary.confidence_spike_detected);
     assert!(!summary.needs_more_work);
@@ -2846,6 +2919,7 @@ fn test_todo_completion_gate_allows_evidence_backed_confidence_steps() {
 #[test]
 fn test_finish_turn_challenges_confidence_spike_once() {
     with_temp_jcode_home(|| {
+        write_test_config("[features]\ntodo_gate_digest = true\n");
         let mut app = create_test_app();
         crate::todo::save_todos(
             &app.session.id,
@@ -2854,14 +2928,14 @@ fn test_finish_turn_challenges_confidence_spike_once() {
                 content: "Validate provider result".to_string(),
                 status: "completed".to_string(),
                 priority: "high".to_string(),
-                confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-                external_blocker: None,
-                completely_blocked: None,
+                confidence: Some(crate::todo::ConfidenceState::Verified),
+                completion_confidence: Some(crate::todo::ConfidenceState::Verified),
+                waiting_reason: None,
+                requires_user_auth: None,
                 waiting_on: Vec::new(),
                 confidence_history: vec![
                     crate::todo::ConfidenceState::Speculative,
-                    crate::todo::ConfidenceState::from_legacy_score(100),
+                    crate::todo::ConfidenceState::Verified,
                 ],
                 ..Default::default()
             }],
@@ -2871,7 +2945,7 @@ fn test_finish_turn_challenges_confidence_spike_once() {
         crate::todo::save_goals(
             &app.session.id,
             &[crate::todo::TodoGoal {
-                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+                delivery_state: Some(crate::todo::DeliveryState::Delivered),
                 autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
                 iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
@@ -2956,6 +3030,7 @@ fn test_finish_turn_without_auto_poke_does_not_queue_confidence_summary() {
             &app.session.id,
             &[crate::todo::TodoItem {
                 lane_after: None,
+                lane_owner: None,
                 stage: None,
                 details: None,
                 group: None,
@@ -2965,11 +3040,11 @@ fn test_finish_turn_without_auto_poke_does_not_queue_confidence_summary() {
                 priority: "high".to_string(),
                 blocked_by: Vec::new(),
                 assigned_to: None,
-                confidence: Some(crate::todo::ConfidenceState::from_legacy_score(90)),
-                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(90)),
+                confidence: Some(crate::todo::ConfidenceState::Plausible),
+                completion_confidence: Some(crate::todo::ConfidenceState::Plausible),
                 confidence_history: Vec::new(),
-                external_blocker: None,
-                completely_blocked: None,
+                waiting_reason: None,
+                requires_user_auth: None,
                 waiting_on: Vec::new(),
             }],
         )
@@ -2997,6 +3072,7 @@ fn test_finish_turn_auto_poke_preserves_visible_turn_started() {
             &app.session.id,
             &[crate::todo::TodoItem {
                 lane_after: None,
+                lane_owner: None,
                 stage: None,
                 details: None,
                 group: None,
@@ -3009,8 +3085,8 @@ fn test_finish_turn_auto_poke_preserves_visible_turn_started() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
-                external_blocker: None,
-                completely_blocked: None,
+                waiting_reason: None,
+                requires_user_auth: None,
                 waiting_on: Vec::new(),
             }],
         )
@@ -3075,8 +3151,8 @@ fn test_finish_turn_does_not_challenge_moderate_or_unrecorded_confidence_jumps()
                     status: "completed".into(),
                     confidence: Some(planning),
                     completion_confidence: Some(completion),
-                    external_blocker: None,
-                    completely_blocked: None,
+                    waiting_reason: None,
+                    requires_user_auth: None,
                     waiting_on: Vec::new(),
                     confidence_history: history,
                     ..Default::default()
@@ -3115,3 +3191,6 @@ fn test_finish_turn_does_not_challenge_moderate_or_unrecorded_confidence_jumps()
 
 #[path = "state_model_poke_03/prompt_history_keys.rs"]
 mod prompt_history_keys;
+
+#[path = "state_model_poke_03_additional_tests.rs"]
+mod additional_test_open_work_rearms_auto_poke_after_completion_gate_breaker;

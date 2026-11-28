@@ -200,9 +200,10 @@ async fn late_mcp_tools_are_announced_once_in_the_transcript() {
     assert!(text.contains("server: late"));
     assert!(text.contains("tool: tool"));
     assert!(
-        text.contains("input_schema: {"),
-        "schema must be included: {text}"
+        !text.contains("input_schema: {"),
+        "schemas are fetched on demand, not announced: {text}"
     );
+    assert!(text.contains("mcp action=search"));
     assert!(text.contains("mcp action=call"));
 
     // Second pass: nothing new, no second announcement, and the cached
@@ -218,6 +219,66 @@ async fn late_mcp_tools_are_announced_once_in_the_transcript() {
         serde_json::to_string(&before).unwrap(),
         serde_json::to_string(&after).unwrap()
     );
+}
+
+#[tokio::test]
+async fn truncated_late_mcp_announcement_does_not_repeat_after_restore() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    register_fake_deferred_mcp_surface(&registry).await;
+    for i in 0..70 {
+        registry
+            .register(
+                format!("mcp__bulk__tool_{i:02}"),
+                Arc::new(FakeMcpTool {
+                    name: format!("tool_{i:02}"),
+                }) as Arc<dyn crate::tool::Tool>,
+            )
+            .await;
+    }
+    let mut agent = Agent::new(provider, registry);
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Auto;
+
+    agent.announce_late_mcp_tools().await;
+    let first: Vec<String> = transcript_texts(&agent)
+        .into_iter()
+        .filter(|t| t.contains("New MCP tools are available."))
+        .collect();
+    assert_eq!(first.len(), 1);
+    assert!(first[0].contains("... and 6 more; use mcp action=search to find them."));
+
+    // Simulate a session reload/restore where the in-memory tracking set starts empty.
+    agent.announced_mcp_tools.clear();
+    agent.announced_mcp_scan_index = 0;
+
+    agent.announce_late_mcp_tools().await;
+    let after_restore = transcript_texts(&agent)
+        .into_iter()
+        .filter(|t| t.contains("New MCP tools are available."))
+        .count();
+    assert_eq!(
+        after_restore, 1,
+        "overflow MCP tools must not be re-announced after session restore"
+    );
+
+    // A genuinely new MCP server connecting later in the resumed session is still announced.
+    agent
+        .registry
+        .register(
+            "mcp__brandnew__ping".to_string(),
+            Arc::new(FakeMcpTool {
+                name: "ping".to_string(),
+            }) as Arc<dyn crate::tool::Tool>,
+        )
+        .await;
+    agent.announce_late_mcp_tools().await;
+    let after_new: Vec<String> = transcript_texts(&agent)
+        .into_iter()
+        .filter(|t| t.contains("New MCP tools are available."))
+        .collect();
+    assert_eq!(after_new.len(), 2);
+    assert!(after_new[1].contains("mcp__brandnew__ping"));
 }
 
 /// Tools already described by an `mcp connect`/`mcp_search` result (tool
@@ -356,4 +417,68 @@ async fn late_mcp_announcement_uses_original_names_for_sanitized_aliases() {
         text.contains("server: yc  tool: hiring.create_job"),
         "{text}"
     );
+}
+
+/// Rarely used built-ins cost thousands of prompt tokens per request while
+/// being called in a few percent of sessions. With native deferred loading
+/// they leave the eager prefix and the loader names them.
+#[tokio::test]
+async fn native_deferral_moves_rare_builtins_behind_the_loader() {
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = native_deferred_agent(crate::config::McpToolsMode::Auto).await;
+    let tools = agent.tool_definitions().await;
+    let eager = eager_names(&tools);
+
+    for common in ["bash", "edit", "read", "todo", "websearch"] {
+        assert!(
+            eager.iter().any(|n| n == common),
+            "{common} must stay eager"
+        );
+    }
+    let deferred: Vec<&str> = tools
+        .iter()
+        .filter(|t| t.defer_loading && !t.name.starts_with("mcp__"))
+        .map(|t| t.name.as_str())
+        .collect();
+    for rare in ["gmail", "calendar", "session_search", "browser", "webfetch"] {
+        assert!(deferred.contains(&rare), "{rare} should be deferred");
+    }
+    let loader = tools
+        .iter()
+        .find(|t| t.name == "load_tools")
+        .expect("loader is offered");
+    assert!(!loader.defer_loading);
+    for name in &deferred {
+        assert!(
+            loader.description.contains(name),
+            "loader must name {name}: {}",
+            loader.description
+        );
+    }
+
+    // The deferred set must not disturb the locked, cached prefix.
+    let again = agent.tool_definitions().await;
+    assert_eq!(eager, eager_names(&again));
+    assert_eq!(tools.len(), again.len());
+}
+
+#[tokio::test]
+async fn providers_without_native_deferral_keep_every_builtin_eager() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    let tools = agent.tool_definitions().await;
+    assert!(tools.iter().all(|t| !t.defer_loading));
+    assert!(tools.iter().any(|t| t.name == "gmail"));
+    assert!(tools.iter().all(|t| t.name != "load_tools"));
+}
+
+#[tokio::test]
+async fn an_allowlist_without_the_loader_defers_nothing() {
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = native_deferred_agent(crate::config::McpToolsMode::Auto).await;
+    agent.allowed_tools = Some(HashSet::from(["bash".to_string(), "gmail".to_string()]));
+    let tools = agent.tool_definitions().await;
+    assert_eq!(eager_names(&tools), ["bash", "gmail"]);
 }

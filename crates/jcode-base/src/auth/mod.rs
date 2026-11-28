@@ -2,6 +2,7 @@ pub mod account_pool;
 pub mod account_store;
 pub mod active_method;
 pub mod antigravity;
+pub mod api_key_login;
 pub mod azure;
 pub mod claude;
 pub mod codex;
@@ -206,7 +207,7 @@ fn log_auth_status_snapshot(event: &str, status: &AuthStatus) {
         "all",
         &[
             ("jcode", auth_state_label(status.jcode)),
-            ("claude", auth_state_label(status.anthropic.state)),
+            ("claude", auth_state_label(status.anthropic.oauth_state)),
             ("openai", auth_state_label(status.openai)),
             ("openrouter", auth_state_label(status.openrouter)),
             ("azure", auth_state_label(status.azure)),
@@ -485,6 +486,7 @@ impl AuthStatus {
     pub fn has_any_untrusted_external_auth() -> bool {
         crate::auth::codex::has_unconsented_legacy_credentials()
             || crate::auth::claude::has_unconsented_external_auth().is_some()
+            || crate::auth::claude::has_unconsented_native_auth()
             || crate::auth::external::has_any_unconsented_external_auth()
             || crate::auth::gemini::has_unconsented_cli_auth()
             || crate::auth::copilot::has_unconsented_external_auth().is_some()
@@ -993,11 +995,13 @@ fn probe_anthropic_status(status: &mut AuthStatus) {
     if let Ok(creds) = claude::load_credentials() {
         let now_ms = chrono::Utc::now().timestamp_millis();
         anthropic.has_oauth = true;
-        if creds.expires_at > now_ms {
-            anthropic.state = AuthState::Available;
-        } else {
-            anthropic.state = AuthState::Expired;
-        }
+        anthropic.state = refreshable_token_state(
+            "claude",
+            Ok((
+                creds.access_token.is_empty() || creds.expires_at <= now_ms,
+                creds.refresh_token,
+            )),
+        );
         // Record the OAuth credential's own state before the API key below can
         // mask an expired (or absent) OAuth login in the combined `state`.
         anthropic.oauth_state = anthropic.state;

@@ -99,7 +99,9 @@ pub fn remote_model_routes_fallback(
             added_any = true;
         }
 
-        if jcode_provider_core::model_id::matches_known_model(model, ALL_OPENAI_MODELS) {
+        // Names-only broadcasts contain live discoveries, not a release
+        // allowlist. Recognize future OpenAI IDs just as full catalog routes do.
+        if provider_for_model(model) == Some("openai") {
             let availability = model_availability_for_account(model);
             let (available, detail) = if auth.openai == AuthState::NotConfigured {
                 (false, "no credentials".to_string())
@@ -419,6 +421,6 @@ pub fn remote_model_is_server_copilot_only(model: &str) -> bool {
         && remote_openai_compatible_route_for_model(model).is_none()
         && !matches!(
             provider_for_model(model),
-            Some("claude" | "openai" | "gemini" | "cursor" | "antigravity")
+            Some("claude" | "openai" | "gemini" | "cursor")
         )
 }

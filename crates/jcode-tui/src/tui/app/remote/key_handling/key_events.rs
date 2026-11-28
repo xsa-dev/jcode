@@ -187,9 +187,6 @@ pub(super) async fn handle_remote_key_internal(
     }
 
     if input::is_next_prompt_new_session_hotkey(code, modifiers) {
-        if app_mod::commands_dispatch::ssh_local_action_blocked(app, "New-session routing") {
-            return Ok(());
-        }
         app.toggle_next_prompt_new_session_routing();
         return Ok(());
     }
@@ -251,50 +248,17 @@ pub(super) async fn handle_remote_key_internal(
     }
 
     if app.toggle_keys.auto_poke.matches(code, modifiers) {
-        if crate::tui::is_ssh_remote() {
-            let args = if app.auto_poke_incomplete_todos {
-                vec!["off".to_string()]
-            } else if app.is_processing {
-                vec!["on".to_string()]
-            } else {
-                Vec::new()
-            };
-            remote.runtime_command("poke", args).await?;
-            app.set_status_notice("Requested remote poke toggle");
-            return Ok(());
-        }
-        if app.auto_poke_incomplete_todos {
-            let cleared = app_mod::commands::disable_auto_poke(app);
-            app.set_status_notice("Poke: OFF");
-            app.push_display_message(DisplayMessage::system(
-                app_mod::commands::poke_disabled_message(cleared),
-            ));
+        // The daemon owns the policy even when its socket is local. Mirror
+        // state only on RuntimeCommandResult, not optimistically on keypress.
+        let args = if app.auto_poke_incomplete_todos {
+            vec!["off".to_string()]
+        } else if app.is_processing {
+            vec!["on".to_string()]
         } else {
-            match app_mod::commands::activate_auto_poke(app) {
-                app_mod::commands::PokeActivation::EnabledNoIncomplete => {
-                    app.push_display_message(DisplayMessage::system(
-                        app_mod::commands::poke_enabled_without_incomplete_message(),
-                    ));
-                }
-                app_mod::commands::PokeActivation::Queued => {
-                    app.push_display_message(DisplayMessage::system(
-                        app_mod::commands::poke_queued_display_message(),
-                    ));
-                }
-                app_mod::commands::PokeActivation::SendNow {
-                    incomplete_count,
-                    poke_msg,
-                } => {
-                    app.push_display_message(DisplayMessage::system(
-                        app_mod::commands::poke_triggered_display_message(incomplete_count),
-                    ));
-
-                    let _ =
-                        begin_remote_send(app, remote, poke_msg, vec![], true, None, true, 0).await;
-                    app.visible_turn_started = Some(Instant::now());
-                }
-            }
-        }
+            Vec::new()
+        };
+        remote.runtime_command("poke", args).await?;
+        app.set_status_notice("Requested remote poke toggle");
         return Ok(());
     }
 
@@ -328,16 +292,12 @@ pub(super) async fn handle_remote_key_internal(
         return Ok(());
     }
 
-    // Swarm views: Alt+N cycles chat → inline controls → full live page → chat.
-    // Selection/open/prompt controls stay available in both active views, while
-    // plain typing continues to flow to the chat input.
+    // Alt+N toggles the dedicated swarm page. Passive worker status lives in
+    // pinned todos rather than a separate inline controls strip.
     if app.toggle_keys.swarm_panel_focus.matches(code, modifiers) {
         match app.cycle_swarm_panel_view() {
             app_mod::tui_state::SwarmPanelView::Chat => {
                 app.set_status_notice("Swarm view closed");
-            }
-            app_mod::tui_state::SwarmPanelView::Controls => {
-                app.set_status_notice(crate::tui::keybind::swarm_view_hint("full page"));
             }
             app_mod::tui_state::SwarmPanelView::FullPage => {
                 app.set_status_notice(crate::tui::keybind::swarm_page_hint());
@@ -698,20 +658,11 @@ pub(super) async fn handle_remote_key_internal(
         return Ok(());
     }
 
-    if input::is_alternate_enter(code, modifiers)
-        && (!app.input.trim().starts_with('/') || app.suggested_replies_has_staged_input())
-    {
+    if input::is_alternate_enter(code, modifiers) && !app.input.trim().starts_with('/') {
         if app.activate_picker_from_preview() {
             return Ok(());
         }
 
-        app.try_stage_suggested_reply_for_remote_enter(true);
-        if app.input.trim().starts_with('/') {
-            if input::try_queue_command(app) {
-                return Ok(());
-            }
-            return submit_remote_enter_input(app, remote).await;
-        }
         if !app.input.is_empty() {
             let prepared = input::take_prepared_input(app);
 
@@ -723,7 +674,7 @@ pub(super) async fn handle_remote_key_internal(
             match app.send_action(true) {
                 SendAction::Submit => submit_prepared_remote_input(app, remote, prepared).await?,
                 SendAction::Queue => {
-                    app.queued_messages.push(prepared.expanded);
+                    queue_prepared_remote_input(app, prepared);
                 }
                 SendAction::Interleave => {
                     app.send_interleave_now(prepared.expanded, prepared.images, remote)
@@ -735,10 +686,6 @@ pub(super) async fn handle_remote_key_internal(
     }
 
     if crate::tui::app::input::newline::enter_inserts_newline(app, code, modifiers) {
-        return Ok(());
-    }
-
-    if app.handle_suggested_replies_arrow_key(code, modifiers) {
         return Ok(());
     }
 
@@ -773,8 +720,6 @@ pub(super) async fn handle_remote_key_internal(
             _ => {}
         }
     }
-
-    app.cancel_suggested_replies_for_cursor_key(code);
 
     // A modified chord (or function key) that reached this point is not bound
     // to anything; tell the user instead of silently swallowing it.
@@ -824,9 +769,7 @@ pub(super) async fn handle_remote_key_internal(
             app.cursor_pos = app.input.len();
         }
         KeyCode::Tab => {
-            if app.handle_suggested_replies_tab_remote() {
-                submit_remote_enter_input(app, remote).await?;
-            }
+            app.autocomplete();
         }
         KeyCode::Enter => {
             submit_remote_enter_input(app, remote).await?;
@@ -866,10 +809,14 @@ pub(super) async fn handle_remote_key_internal(
                         .queued_messages
                         .iter()
                         .any(|message| app_mod::commands::is_poke_message(message));
+                // Esc without a redirect pauses daemon-owned continuation until
+                // the user sends a new prompt. Send the control before
+                // cancellation reaches a turn boundary.
+                remote.runtime_command("poke", vec!["pause".into()]).await?;
                 remote.cancel_with_reason("keyboard_escape").await?;
                 if disabled_auto_poke {
                     app_mod::commands::disable_auto_poke(app);
-                    app.set_status_notice("Interrupting... Auto-poke OFF");
+                    app.set_status_notice("Interrupting... Auto-poke paused");
                 } else {
                     app.set_status_notice("Interrupting...");
                 }

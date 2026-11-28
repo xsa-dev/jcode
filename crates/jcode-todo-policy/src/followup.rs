@@ -1,23 +1,21 @@
 //! Turn-end follow-up policy: auto-poke and the todo quality gates.
 //!
-//! This is the client-side state machine that decides, after a turn ends, what
-//! (if anything) to send next: the incomplete-todo poke, the one-shot
-//! long-session review, the ownership gate, the completion-confidence and
-//! confidence-spike checks, and the final-response
-//! handoff. It is a faithful port of the TUI's `schedule_auto_poke_followup`
-//! so every client (TUI, Desktop, SDK users) runs the same policy.
+//! This state machine decides, after a model turn ends, what (if anything)
+//! should run next: incomplete-todo pokes, the one-shot long-session review,
+//! ownership, completion-confidence and confidence-spike checks, and the final
+//! response handoff. The daemon owns it for connected sessions, so clients must
+//! not independently dispatch these follow-ups. Standalone embeddings may use
+//! the same pure policy when they own their agent runtime.
 //!
-//! It is pure: callers fetch a [`TodoSnapshot`] (the SDK's `todo_state`),
-//! call [`FollowUpPolicy::decide`], send the returned message, and apply the
-//! returned [`TodoEffects`] (the SDK's `ack_todo_follow_up`).
+//! Callers load a [`TodoSnapshot`], call [`FollowUpPolicy::decide`], run the
+//! returned message, and apply [`TodoEffects`] before deciding again.
 
 use crate::{
     ConfidenceState, GateObservation, TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE,
     TODO_LONG_SESSION_REVIEW_MESSAGE, TodoGoal, TodoItem, TodoPlan, build_actionable_poke_message,
-    build_todo_completion_continuation_message, build_todo_confidence_spike_continuation_message,
-    build_todo_ownership_continuation_message, completed_groups_have_sufficient_delivery,
-    completion_confidence_passes, spike_completed_todos, todo_status_is_cancelled,
-    todo_status_is_completed,
+    build_todo_confidence_spike_continuation_message, build_todo_ownership_continuation_message,
+    completed_groups_have_sufficient_delivery, completion_confidence_passes, spike_completed_todos,
+    todo_status_is_cancelled, todo_status_is_completed,
 };
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +78,9 @@ pub struct TodoSnapshot {
     /// or terminal task IDs must not suppress actionable work.
     #[serde(default)]
     pub running_background_tasks: Vec<String>,
+    /// Assigned worker sessions confirmed to have a live turn, never the root itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub running_workers: Vec<String>,
 }
 
 /// A dependency blocks a todo only while the referenced task is running.
@@ -92,26 +93,34 @@ pub fn todo_waits_on_running_task(
     todo.waiting_on.iter().any(|task_id| is_running(task_id))
 }
 
-/// Explicit external waits remain incomplete. Their review time only restores
-/// actionability so the agent can reassess, never marks them done.
-pub fn todo_has_external_blocker_at(todo: &TodoItem, now: chrono::DateTime<chrono::Utc>) -> bool {
-    is_incomplete_todo(todo)
-        && todo
-            .external_blocker
-            .as_ref()
-            .is_some_and(|blocker| !blocker.reason.trim().is_empty() && blocker.review_at > now)
+/// The declared reason a goal is impossible to complete, if any.
+pub fn goal_cannot_complete(goal: &TodoGoal) -> Option<&str> {
+    goal.cannot_complete
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
 }
 
-pub fn todo_has_external_blocker(todo: &TodoItem) -> bool {
-    todo_has_external_blocker_at(todo, chrono::Utc::now())
+/// Items carry no block of their own. Unfinished work stops being continued
+/// only when its whole goal was declared impossible to complete.
+pub fn todo_goal_cannot_complete(todo: &TodoItem, goals: &[TodoGoal]) -> bool {
+    is_incomplete_todo(todo) && todo_cannot_complete_reason(todo, goals).is_some()
 }
 
-/// Only valid, incomplete complete blockers suppress work. Programmatically
-/// constructed snapshots may bypass the persisted type's field validation.
-pub fn todo_completely_blocked(todo: &TodoItem) -> bool {
+pub fn todo_cannot_complete_reason<'a>(todo: &TodoItem, goals: &'a [TodoGoal]) -> Option<&'a str> {
+    let group = crate::normalized_group(todo.group.as_deref());
+    goals
+        .iter()
+        .find(|goal| crate::normalized_group(goal.group.as_deref()) == group)
+        .and_then(goal_cannot_complete)
+}
+
+/// Only a valid authorization request on unfinished work pauses it.
+/// Programmatically constructed snapshots may bypass field validation.
+pub fn todo_requires_user_auth(todo: &TodoItem) -> bool {
     is_incomplete_todo(todo)
         && todo
-            .completely_blocked
+            .requires_user_auth
             .as_ref()
             .is_some_and(|required| !required.reason.trim().is_empty())
 }
@@ -191,6 +200,8 @@ pub struct FollowUpPolicy {
     gate_attempts: u8,
     spike_challenged: bool,
     last_ownership_fingerprint: Option<String>,
+    #[serde(default)]
+    last_ownership_work: Option<Vec<(String, String, Option<String>, String)>>,
     incomplete_budget: IncompleteTodoBudget,
     gate_digest_enabled: bool,
     gate_digest_delivered: bool,
@@ -198,6 +209,22 @@ pub struct FollowUpPolicy {
 
 pub fn is_incomplete_todo(todo: &TodoItem) -> bool {
     !todo_status_is_completed(&todo.status) && !todo_status_is_cancelled(&todo.status)
+}
+
+fn canonical_todo_work(todos: &[TodoItem]) -> Vec<(String, String, Option<String>, String)> {
+    let mut items: Vec<_> = todos
+        .iter()
+        .map(|todo| {
+            (
+                todo.id.clone(),
+                todo.content.clone(),
+                crate::normalized_group(todo.group.as_deref()),
+                todo.status.clone(),
+            )
+        })
+        .collect();
+    items.sort();
+    items
 }
 
 impl FollowUpPolicy {
@@ -214,8 +241,10 @@ impl FollowUpPolicy {
         self.armed || self.default_on
     }
 
-    /// Configure `features.todo_gate_digest` (default false), independently of
-    /// report display. Changing this does not reset the current cycle.
+    /// Configure `features.todo_gate_digest` (default false). This explicitly
+    /// opts into all automatic quality reviews, including legacy confidence,
+    /// ownership, and long-session gates. Incomplete-work pokes are independent.
+    /// Changing this does not reset the current cycle.
     pub fn set_gate_digest_enabled(&mut self, enabled: bool) {
         self.gate_digest_enabled = enabled;
     }
@@ -283,6 +312,7 @@ impl FollowUpPolicy {
             self.spike_challenged = false;
             self.gate_digest_delivered = false;
             self.last_ownership_fingerprint = None;
+            self.last_ownership_work = None;
         }
 
         let incomplete: Vec<&TodoItem> = todos.iter().filter(|t| is_incomplete_todo(t)).collect();
@@ -290,8 +320,12 @@ impl FollowUpPolicy {
             .iter()
             .copied()
             .filter(|todo| {
-                !todo_completely_blocked(todo)
-                    && !todo_has_external_blocker(todo)
+                !todo_requires_user_auth(todo)
+                    && !todo
+                        .assigned_to
+                        .as_ref()
+                        .is_some_and(|id| snapshot.running_workers.contains(id))
+                    && !todo_goal_cannot_complete(todo, goals)
                     && !todo_waits_on_running_task(todo, |id| {
                         snapshot
                             .running_background_tasks
@@ -300,14 +334,19 @@ impl FollowUpPolicy {
                     })
             })
             .collect();
-        if !incomplete.is_empty() && actionable.is_empty() {
+        let delivery_message = if actionable.is_empty() {
+            crate::undelivered_goal_message(todos, goals)
+        } else {
+            None
+        };
+        if !incomplete.is_empty() && actionable.is_empty() && delivery_message.is_none() {
             // Waiting is not resistance or completion. A completion wake will
             // re-enter the policy with fresh runtime facts and a fresh budget.
             self.incomplete_budget = IncompleteTodoBudget::default();
             return Decision::default();
         }
 
-        if !todos.is_empty() && snapshot.long_session_review_due {
+        if self.gate_digest_enabled && !todos.is_empty() && snapshot.long_session_review_due {
             return Decision::send(
                 FollowUpKind::LongSessionReview,
                 TODO_LONG_SESSION_REVIEW_MESSAGE.to_string(),
@@ -319,17 +358,19 @@ impl FollowUpPolicy {
             });
         }
 
-        if !incomplete.is_empty() {
+        if !actionable.is_empty() {
             return self.poke_incomplete(&actionable);
         }
 
         // Completing or removing the list ends the prior poke cycle.
         self.incomplete_budget = IncompleteTodoBudget::default();
-        if todos.is_empty() {
+        if todos.is_empty() && delivery_message.is_none() {
             // Stay armed: a todo-free turn must not disable poking for later
             // turns that do leave work open.
             self.final_response_requested = false;
+            self.gate_attempts = 0;
             self.last_ownership_fingerprint = None;
+            self.last_ownership_work = None;
             self.gate_digest_delivered = false;
             return Decision::default();
         }
@@ -354,9 +395,23 @@ impl FollowUpPolicy {
             .with_effects(effects);
         }
 
-        let ownership_needs_followup = !completed_groups_have_sufficient_delivery(todos, goals);
+        let ownership_needs_followup = delivery_message.is_some()
+            || (self.gate_digest_enabled
+                && !completed_groups_have_sufficient_delivery(todos, goals));
+        let ownership_work = canonical_todo_work(todos);
+        let todo_work_progressed = self
+            .last_ownership_work
+            .as_ref()
+            .is_some_and(|previous| previous != &ownership_work);
+        if ownership_needs_followup && todo_work_progressed {
+            // New todo work was completed since the last ownership poke; treat
+            // this as forward progress rather than a stall on the same gap.
+            self.last_ownership_fingerprint = None;
+            self.gate_attempts = 0;
+        }
         let gate_budget_left = self.gate_attempts < MAX_GATE_ATTEMPTS;
-        let ownership_message = build_todo_ownership_continuation_message(todos, goals);
+        let ownership_message = delivery_message
+            .unwrap_or_else(|| build_todo_ownership_continuation_message(todos, goals));
         let ownership_fingerprint = Some(ownership_message.clone());
         if ownership_needs_followup && self.last_ownership_fingerprint == ownership_fingerprint {
             // Already asked about this exact gap: keep the honest assessment
@@ -365,6 +420,7 @@ impl FollowUpPolicy {
         }
         if ownership_needs_followup && gate_budget_left {
             self.last_ownership_fingerprint = ownership_fingerprint;
+            self.last_ownership_work = Some(ownership_work);
             self.gate_attempts = self.gate_attempts.saturating_add(1);
             return Decision::send(
                 FollowUpKind::Ownership,
@@ -375,13 +431,18 @@ impl FollowUpPolicy {
         }
 
         let summary = ConfidenceSummary::of(todos);
-        let needs_spike_challenge = summary.spike_detected && !self.spike_challenged;
-        if (summary.needs_validation || needs_spike_challenge) && gate_budget_left {
+        let needs_spike_challenge =
+            self.gate_digest_enabled && summary.spike_detected && !self.spike_challenged;
+        // Goals that document why validation stopped exempt their todos:
+        // asking again cannot change an exhausted constraint.
+        let validation_targets = crate::todos_needing_validation(todos, goals);
+        let needs_validation = self.gate_digest_enabled && !validation_targets.is_empty();
+        if (needs_validation || needs_spike_challenge) && gate_budget_left {
             self.gate_attempts = self.gate_attempts.saturating_add(1);
-            let decision = if summary.needs_validation {
+            let decision = if needs_validation {
                 Decision::send(
                     FollowUpKind::CompletionValidation,
-                    build_todo_completion_continuation_message(todos),
+                    crate::build_todo_validation_continuation_message(&validation_targets),
                     "🔍 Double-checking confidence for you...",
                 )
             } else {
@@ -394,7 +455,7 @@ impl FollowUpPolicy {
             };
             return decision.with_effects(effects);
         }
-        if (ownership_needs_followup || summary.needs_validation || needs_spike_challenge)
+        if (ownership_needs_followup || needs_validation || needs_spike_challenge)
             && !gate_budget_left
         {
             // The gate keeps failing without progress. Nudging again would
@@ -440,6 +501,7 @@ impl FollowUpPolicy {
         self.gate_digest_delivered = false;
         self.spike_challenged = false;
         self.last_ownership_fingerprint = None;
+        self.last_ownership_work = None;
         let todos: Vec<_> = incomplete.iter().map(|todo| (*todo).clone()).collect();
         let message = build_actionable_poke_message(&todos);
         if !self.incomplete_budget.allow_follow_up(&todos) {
@@ -465,8 +527,8 @@ impl FollowUpPolicy {
 /// Completion-confidence summary over the completed todos.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfidenceSummary {
-    /// Priority-weighted average of recorded completion confidence (0-100).
-    pub average: Option<u8>,
+    /// Priority-weighted average of recorded completion confidence.
+    pub average: Option<ConfidenceState>,
     pub needs_validation: bool,
     pub spike_detected: bool,
 }
@@ -489,11 +551,12 @@ impl ConfidenceSummary {
         for todo in &completed {
             if let Some(state) = todo.completion_confidence {
                 let w = priority_weight(&todo.priority);
-                sum += u32::from(state.legacy_score()) * w;
+                sum += u32::from(state.level()) * w;
                 weight += w;
             }
         }
-        let average = (weight > 0).then(|| ((sum + weight / 2) / weight) as u8);
+        let average =
+            (weight > 0).then(|| ConfidenceState::from_level(((sum + weight / 2) / weight) as u8));
         let needs_validation = !completed.is_empty()
             && completed.iter().any(|todo| {
                 todo.completion_confidence.is_none()
@@ -508,7 +571,6 @@ impl ConfidenceSummary {
 
     pub fn label(&self) -> String {
         self.average
-            .map(ConfidenceState::from_legacy_score)
             .map(|state| state.as_str().to_string())
             .unwrap_or_else(|| "unknown".to_string())
     }

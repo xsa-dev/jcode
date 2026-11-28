@@ -1,48 +1,6 @@
 use super::*;
 
 #[test]
-fn pinned_dependency_label_uses_available_width_and_palette() {
-    let task = TodoCardBackgroundTask {
-        task_id: "resume".into(),
-        label: "Resume lint validation".into(),
-        percent: Some(38.0),
-    };
-    let line = todo_dependency_progress(&[&task], 60);
-    assert!(line.to_string().contains(&task.label));
-    assert_eq!(line.spans[0].style.fg, Some(todo_meta_color()));
-    for width in 0..100 {
-        assert!(todo_dependency_progress(&[&task], width).width() <= width);
-    }
-}
-
-#[test]
-fn expanded_diff_rows_preserve_source_and_align_continuations() {
-    let source = "    let result = compute(\"界界 e\u{301}\", argument);";
-    let parsed = ParsedDiffLine {
-        kind: DiffLineKind::Add,
-        prefix: "9+ ".into(),
-        content: source.into(),
-        file_path: None,
-    };
-    let rows = expanded_diff_row(&parsed, Some("rs"), 3, 24);
-    assert!(rows.len() > 1);
-    assert!(extract_line_text(&rows[0]).starts_with("│   9 +     let"));
-    let mut reconstructed = String::new();
-    for (index, row) in rows.iter().enumerate() {
-        assert!(row.width() <= 24, "{row:?}");
-        assert_eq!(row.alignment, Some(Alignment::Left));
-        if index > 0 {
-            assert!(extract_line_text(row).starts_with("│     ↪ "));
-        }
-        for span in row.spans.iter().skip(if index == 0 { 2 } else { 1 }) {
-            reconstructed.push_str(&span.content);
-        }
-    }
-    assert_eq!(reconstructed, source);
-    assert_eq!(rows[0].spans[1].style.fg, Some(diff_add_color()));
-}
-
-#[test]
 fn expanded_diff_rows_fit_narrow_widths_and_expand_tabs() {
     let parsed = ParsedDiffLine {
         kind: DiffLineKind::Del,
@@ -985,6 +943,27 @@ fn render_background_task_failure_without_diagnostic_is_honest() {
 }
 
 #[test]
+fn selfdev_build_status_uses_one_tool_row() {
+    for (status, label) in [
+        ("running", "◌ selfdev build · running"),
+        ("↻ superseded", "↻ selfdev build · superseded"),
+    ] {
+        let msg = DisplayMessage::background_task(format!(
+            "**Background task** `bg123` · `selfdev-build` · {status} · 84.0s · exit 0\n\n```text\ncompiler output\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"bg123\"`"
+        ));
+        for width in [20, 80] {
+            let lines =
+                render_background_task_message(&msg, width, crate::config::DiffDisplayMode::Off);
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].width() <= width as usize);
+            if width == 80 {
+                assert!(lines[0].to_string().contains(label));
+            }
+        }
+    }
+}
+
+#[test]
 fn render_background_task_success_is_compact_and_preserves_raw_output() {
     let msg = DisplayMessage::background_task(
         "**Background task** `bg123` · `bash` · ✓ completed · 7.1s · exit 0\n\n```text\nline 1\nline 2\nline 3\nline 4\nline 5\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"bg123\"`",
@@ -1292,7 +1271,7 @@ fn complete_blocker_row_precedes_background_clock_and_preserves_reason() {
         content: "Connect account".into(),
         status: "in_progress".into(),
         waiting_on: vec!["build".into()],
-        completely_blocked: Some(crate::todo::TodoCompleteBlocker {
+        requires_user_auth: Some(crate::todo::TodoUserAuth {
             reason: "Only you can authorize\nthis account ✋".into(),
         }),
         ..Default::default()
@@ -1311,7 +1290,7 @@ fn complete_blocker_row_precedes_background_clock_and_preserves_reason() {
         let row = render_todo_item_line_with_background(&todo, &[], &tasks, "", width);
         assert!(row.width() <= width, "{width}: {row:?}");
     }
-    todo.completely_blocked = None;
+    todo.requires_user_auth = None;
     assert!(
         render_todo_item_line_with_background(&todo, &[], &tasks, "", 240)
             .to_string()
@@ -1321,11 +1300,11 @@ fn complete_blocker_row_precedes_background_clock_and_preserves_reason() {
     assert!(
         !render_todo_card_item_line(&todo, "", 240)
             .to_string()
-            .contains("Completely blocked")
+            .contains("Needs your login")
     );
     for status in ["completed", "cancelled"] {
         todo.status = status.into();
-        todo.completely_blocked = Some(crate::todo::TodoCompleteBlocker {
+        todo.requires_user_auth = Some(crate::todo::TodoUserAuth {
             reason: "Only you".into(),
         });
         assert!(
@@ -1337,28 +1316,26 @@ fn complete_blocker_row_precedes_background_clock_and_preserves_reason() {
 }
 
 #[test]
-fn complete_blocker_detail_displays_reason_without_user_action_framing() {
+fn user_auth_detail_names_the_authorization_and_flattens_the_reason() {
     let todo = crate::todo::TodoItem {
-        completely_blocked: Some(crate::todo::TodoCompleteBlocker {
-            reason: "No way forward.".into(),
+        requires_user_auth: Some(crate::todo::TodoUserAuth {
+            reason: "Log in to the\ndeploy dashboard".into(),
         }),
         ..Default::default()
     };
     assert_eq!(
         todo_complete_blocker_detail(&todo),
-        "Completely blocked: No way forward."
+        "Needs your login: Log in to the deploy dashboard"
     );
 }
 
 #[test]
-fn external_blocker_todo_row_shows_reason_deadline_and_never_wraps() {
+fn waiting_todo_row_shows_its_reason_and_never_wraps() {
     let mut todo = crate::todo::TodoItem {
         content: "Acceptance".into(),
         status: "pending".into(),
-        external_blocker: Some(crate::todo::TodoExternalBlocker {
-            reason: "Frozen source awaiting coordinator".into(),
-            review_at: chrono::Utc::now() + chrono::Duration::hours(1),
-        }),
+        waiting_on: vec!["bench".into()],
+        waiting_reason: Some("Benchmark rerun in progress".into()),
         ..Default::default()
     };
     let wide = extract_line_text(&render_todo_item_line_with_background(
@@ -1369,25 +1346,30 @@ fn external_blocker_todo_row_shows_reason_deadline_and_never_wraps() {
         160,
     ));
     assert!(
-        wide.contains("blocked: Frozen source awaiting coordinator"),
+        wide.contains("waiting: Benchmark rerun in progress"),
         "{wide}"
     );
-    assert!(wide.contains("review ") && wide.contains("UTC"));
+    assert!(!wide.contains('⊘') && !wide.contains("blocked"), "{wide}");
     for width in 0..160 {
         let line = render_todo_item_line_with_background(&todo, &[], &[], "", width);
         assert!(extract_line_text(&line).width() <= width);
     }
-    todo.external_blocker.as_mut().unwrap().review_at =
-        chrono::Utc::now() - chrono::Duration::seconds(1);
-    let expired = extract_line_text(&render_todo_item_line_with_background(
-        &todo,
-        &[],
-        &[],
-        "",
-        160,
-    ));
-    assert!(expired.contains("review due"));
-    assert_eq!(todo.status, "pending");
+    // The reason belongs to the wait: no IDs or a finished todo, no note.
+    for (ids, status) in [
+        (vec![], "pending"),
+        (vec!["bench".to_string()], "completed"),
+    ] {
+        todo.waiting_on = ids;
+        todo.status = status.into();
+        let text = extract_line_text(&render_todo_item_line_with_background(
+            &todo,
+            &[],
+            &[],
+            "",
+            160,
+        ));
+        assert!(!text.contains("waiting:"), "{text}");
+    }
 }
 
 #[test]
@@ -1457,17 +1439,18 @@ fn render_todos_message_shows_grouped_card_with_status_glyphs() {
     fn todo(id: &str, content: &str, status: &str, group: Option<&str>) -> crate::todo::TodoItem {
         crate::todo::TodoItem {
             lane_after: None,
+            lane_owner: None,
             id: id.to_string(),
             content: content.to_string(),
             status: status.to_string(),
             priority: "high".to_string(),
             group: group.map(str::to_string),
-            confidence: Some(crate::todo::ConfidenceState::from_legacy_score(80)),
+            confidence: Some(crate::todo::ConfidenceState::Plausible),
             completion_confidence: (status == "completed")
-                .then_some(crate::todo::ConfidenceState::from_legacy_score(95)),
+                .then_some(crate::todo::ConfidenceState::Plausible),
             confidence_history: Vec::new(),
-            external_blocker: None,
-            completely_blocked: None,
+            waiting_reason: None,
+            requires_user_auth: None,
             waiting_on: Vec::new(),
             blocked_by: Vec::new(),
             assigned_to: None,
@@ -1541,6 +1524,7 @@ fn render_todos_message_shows_grouped_card_with_status_glyphs() {
 fn render_todos_message_shows_goal_scores_without_verbose_feedback() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         stage: None,
         details: None,
         id: "1".to_string(),
@@ -1548,30 +1532,30 @@ fn render_todos_message_shows_goal_scores_without_verbose_feedback() {
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: Some("todo rendering".to_string()),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(85)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         completion_confidence: None,
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         confidence_history: vec![
-            crate::todo::ConfidenceState::from_legacy_score(80),
-            crate::todo::ConfidenceState::from_legacy_score(85),
+            crate::todo::ConfidenceState::Plausible,
+            crate::todo::ConfidenceState::Plausible,
         ],
         blocked_by: Vec::new(),
         assigned_to: None,
     }];
     let goals = vec![crate::todo::TodoGoal {
         group: Some("todo rendering".to_string()),
-        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(95)),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Strong),
         feedback_loop: Some("Inspect a debug frame".to_string()),
         feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
         feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
-        delivery_state: Some(crate::todo::DeliveryState::from_legacy_score(90)),
+        delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
         ..Default::default()
     }];
     let plan = crate::todo::TodoPlan {
         user_intention: Some("Keep the agent aligned with the user's request".to_string()),
-        understands_user_intent: Some(crate::todo::IntentUnderstanding::from_legacy_score(98)),
+        understands_user_intent: Some(crate::todo::IntentUnderstanding::Clear),
         ..Default::default()
     };
     let msg = DisplayMessage::todos(
@@ -1585,7 +1569,7 @@ fn render_todos_message_shows_goal_scores_without_verbose_feedback() {
         .join("\n");
 
     assert!(plain.contains("Closed feedback loop strong"), "{plain}");
-    assert!(!plain.contains("Delivery "), "{plain}");
+    assert!(plain.contains("Delivery partially_delivered"), "{plain}");
     assert!(!plain.contains("Relevance representative"), "{plain}");
     assert!(!plain.contains("Coverage main_paths"), "{plain}");
     // Only the plan-level assessment renders above the groups.
@@ -1605,6 +1589,7 @@ fn render_todos_message_shows_user_intention_when_understanding_is_unclear() {
     let long_text = "This deliberately long assessment detail should not consume several rows in a narrow terminal window";
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Keep the task visible".to_string(),
         status: "in_progress".to_string(),
@@ -1613,8 +1598,8 @@ fn render_todos_message_shows_user_intention_when_understanding_is_unclear() {
         confidence: None,
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -1692,16 +1677,17 @@ fn render_todos_message_shows_user_intention_when_understanding_is_unclear() {
 fn render_todos_message_uses_readable_semantic_colors() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Tune the palette".to_string(),
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: Some("todo rendering".to_string()),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(85)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -1710,13 +1696,13 @@ fn render_todos_message_uses_readable_semantic_colors() {
     }];
     let goals = vec![crate::todo::TodoGoal {
         group: Some("todo rendering".to_string()),
-        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(95)),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Strong),
         feedback_loop: None,
         ..Default::default()
     }];
     let plan = crate::todo::TodoPlan {
         user_intention: Some("Readable metadata".to_string()),
-        understands_user_intent: Some(crate::todo::IntentUnderstanding::from_legacy_score(98)),
+        understands_user_intent: Some(crate::todo::IntentUnderstanding::Clear),
         ..Default::default()
     };
     let msg = DisplayMessage::todos(
@@ -1757,7 +1743,7 @@ fn finished_chat_todo_cards_show_lane_names_and_dots_without_changing_saved_data
                 todos.to_string()
             } else {
                 serde_json::json!({"todos":todos,
-                    "plan":{"user_intention":"Verbose intention", "understands_user_intent":"complete"},
+                    "plan":{"user_intention":"Verbose intention", "understands_user_intent":"clear"},
                     "goals":[{"closed_feedback_loop":"strong", "feedback_loop":"Verbose evidence"}]
                 }).to_string()
             };
@@ -1844,10 +1830,6 @@ fn render_todos_message_color_codes_every_intent_state() {
             todo_warning_color(),
         ),
         (crate::todo::IntentUnderstanding::Clear, todo_score_color()),
-        (
-            crate::todo::IntentUnderstanding::Complete,
-            todo_score_color(),
-        ),
     ];
 
     for (state, expected_color) in cases {
@@ -1879,9 +1861,69 @@ fn render_todos_message_color_codes_every_intent_state() {
 }
 
 #[test]
+fn render_todos_message_shows_delivery_state_under_intent() {
+    let msg = DisplayMessage::todos(
+        serde_json::json!({
+            "todos": [{
+                "id": "1",
+                "content": "Ship delivery state",
+                "status": "in_progress",
+                "priority": "high",
+                "group": "ui"
+            }],
+            "plan": {
+                "user_intention": "Show delivery state under intent",
+                "understands_user_intent": "clear",
+            },
+            "goals": [
+                {"group": "ui", "delivery_state": "delivered", "verification_state": "checked_in_isolation"},
+                {"group": "tests", "delivery_state": "partially_delivered", "verification_state": "checked_end_to_end"}
+            ],
+        })
+        .to_string(),
+    );
+    let lines = render_todos_message(&msg, 80, crate::config::DiffDisplayMode::Off);
+    let text_lines: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    let intent_idx = text_lines
+        .iter()
+        .position(|line| line.contains("Intent clear: Show delivery state under intent"))
+        .expect("intent line should render");
+    assert!(
+        text_lines
+            .get(intent_idx + 1)
+            .is_some_and(|line| line.contains("Delivery partially_delivered")),
+        "delivery state should render immediately under intent (using lowest goal state): {text_lines:?}"
+    );
+    assert!(!text_lines.iter().any(|line| line.contains("Verification")));
+    let pinned = render_pinned_todos_message(&msg, 80, crate::config::DiffDisplayMode::Off);
+    let pinned = pinned.iter().map(extract_line_text).collect::<Vec<_>>().join("\n");
+    assert!(pinned.contains("Delivery partially_delivered"), "{pinned}");
+    assert!(!pinned.contains("Verification"), "{pinned}");
+    for narrow in [16u16, 20, 28] {
+        let narrow_lines = render_todos_message(&msg, narrow, crate::config::DiffDisplayMode::Off);
+        for line in &narrow_lines {
+            assert!(
+                line.width() <= narrow as usize,
+                "row exceeded width {narrow}: {:?}",
+                line
+            );
+        }
+    }
+}
+
+#[test]
 fn render_todos_message_collapses_passing_quality_gates() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Verify the result".to_string(),
         status: "completed".to_string(),
@@ -1890,8 +1932,8 @@ fn render_todos_message_collapses_passing_quality_gates() {
         confidence: None,
         completion_confidence: Some(crate::todo::ConfidenceState::Validated),
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -1904,7 +1946,7 @@ fn render_todos_message_collapses_passing_quality_gates() {
         feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::AcceptanceAligned),
         feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths),
         feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
-        delivery_state: Some(crate::todo::DeliveryState::OutcomeDelivered),
+        delivery_state: Some(crate::todo::DeliveryState::Delivered),
         ..Default::default()
     }];
     let msg =
@@ -1919,7 +1961,7 @@ fn render_todos_message_collapses_passing_quality_gates() {
         .join("\n");
 
     assert!(plain.contains("✓ All quality gates passing"), "{plain}");
-    assert!(!plain.contains("Delivery "), "{plain}");
+    assert!(plain.contains("Delivery delivered"), "{plain}");
     assert!(!plain.contains("Closed feedback loop closed"), "{plain}");
     assert!(!plain.contains("Relevance acceptance_aligned"), "{plain}");
     assert!(
@@ -1935,19 +1977,39 @@ fn render_todos_message_collapses_passing_quality_gates() {
 }
 
 #[test]
+fn pinned_completed_todos_color_delivery_independently_of_verification() {
+    for (delivery, expected) in [
+        ("undelivered", todo_failure_color()),
+        ("partially_delivered", todo_warning_color()),
+        ("delivered", todo_score_color()),
+    ] {
+        let msg = DisplayMessage::todos(serde_json::json!({
+            "todos": [{"id": "1", "content": "Finish task", "status": "completed", "priority": "high"}],
+            "goals": [{"delivery_state": delivery, "verification_state": "checked_end_to_end"}],
+        }).to_string());
+        let lines = render_pinned_todos_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+        let color = |value: &str| lines.iter().flat_map(|l| &l.spans)
+            .find(|s| s.content.as_ref() == value).and_then(|s| s.style.fg);
+        assert_eq!(color(delivery), Some(expected));
+        assert_eq!(color("checked_end_to_end"), None);
+    }
+}
+
+#[test]
 fn render_todos_message_wraps_goal_scores_at_narrow_widths() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Render the card".to_string(),
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: Some("todo rendering".to_string()),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(85)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -1956,9 +2018,9 @@ fn render_todos_message_wraps_goal_scores_at_narrow_widths() {
     }];
     let goals = vec![crate::todo::TodoGoal {
         group: Some("todo rendering".to_string()),
-        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(95)),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Strong),
         feedback_loop: None,
-        delivery_state: Some(crate::todo::DeliveryState::from_legacy_score(90)),
+        delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
         ..Default::default()
     }];
     let msg =
@@ -1972,7 +2034,7 @@ fn render_todos_message_wraps_goal_scores_at_narrow_widths() {
         .join("\n");
 
     assert!(plain.contains("Closed feedback loop strong"), "{plain}");
-    assert!(!plain.contains("Delivery "), "{plain}");
+    assert!(plain.contains("Delivery partially_delivered"), "{plain}");
     assert!(
         lines.iter().all(|line| line.width() <= 38),
         "card exceeded its 38-column content budget: {plain}"
@@ -1983,16 +2045,17 @@ fn render_todos_message_wraps_goal_scores_at_narrow_widths() {
 fn render_todos_message_packs_multiple_goal_gates_per_row() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Render the card".to_string(),
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: Some("todo rendering".to_string()),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(85)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -2004,7 +2067,7 @@ fn render_todos_message_packs_multiple_goal_gates_per_row() {
         closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Usable),
         feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
         feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
-        delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+        delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
         ..Default::default()
     }];
     let msg =
@@ -2054,6 +2117,7 @@ fn render_todos_message_bad_payload_falls_back_to_system() {
 fn render_todo_tool_result_uses_borderless_card_with_goal_scores() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         stage: None,
         details: None,
         id: "render".to_string(),
@@ -2061,23 +2125,23 @@ fn render_todo_tool_result_uses_borderless_card_with_goal_scores() {
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: Some("todo rendering".to_string()),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(92)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         completion_confidence: None,
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         confidence_history: vec![
-            crate::todo::ConfidenceState::from_legacy_score(85),
-            crate::todo::ConfidenceState::from_legacy_score(92),
+            crate::todo::ConfidenceState::Plausible,
+            crate::todo::ConfidenceState::Plausible,
         ],
         blocked_by: Vec::new(),
         assigned_to: None,
     }];
     let goals = vec![crate::todo::TodoGoal {
         group: Some("todo rendering".to_string()),
-        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(95)),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Strong),
         feedback_loop: Some("Inspect the rendered frame".to_string()),
-        delivery_state: Some(crate::todo::DeliveryState::from_legacy_score(92)),
+        delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
         ..Default::default()
     }];
     let content = format!(
@@ -2112,7 +2176,7 @@ fn render_todo_tool_result_uses_borderless_card_with_goal_scores() {
     assert!(plain.contains("Closed feedback loop strong"), "{plain}");
     assert!(plain.contains("Relevance missing"), "{plain}");
     assert!(plain.contains("Coverage missing"), "{plain}");
-    assert!(!plain.contains("Delivery "), "{plain}");
+    assert!(plain.contains("Delivery partially_delivered"), "{plain}");
     assert!(plain.contains("● Render the todo result"), "{plain}");
     assert!(!plain.contains("(high)"), "{plain}");
     assert!(
@@ -2133,19 +2197,19 @@ fn render_todo_quality_gate_retry_shows_only_changed_goal_fields() {
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: Some("todo rendering".to_string()),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(92)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         ..Default::default()
     }];
     let before = crate::todo::TodoGoal {
         group: Some("todo rendering".to_string()),
-        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(90)),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Strong),
         feedback_loop: Some("Inspect one frame".to_string()),
         feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Indirect),
         feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::Narrow),
         ..Default::default()
     };
     let after = crate::todo::TodoGoal {
-        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(98)),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
         feedback_loop: Some(
             "Render before and after fixtures and assert unchanged fields are absent".to_string(),
         ),
@@ -2224,7 +2288,7 @@ fn render_goal_update_size_is_bounded_when_narrative_evidence_is_long() {
     let goal = crate::todo::TodoGoal {
         group: Some("compact assessment".to_string()),
         closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Strong),
-        delivery_state: Some(crate::todo::DeliveryState::Integrated),
+        delivery_state: Some(crate::todo::DeliveryState::Undelivered),
         autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
         iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
         feedback_loop: Some(long_text.clone()),
@@ -2264,16 +2328,16 @@ fn render_todo_plan_update_card_shows_only_changed_intent_fields() {
         content: "Render the entire unchanged todo plan".to_string(),
         status: "in_progress".to_string(),
         priority: "high".to_string(),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(92)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         ..Default::default()
     }];
     let before = crate::todo::TodoPlan {
         user_intention: Some("Ship the plan-level intent gate".to_string()),
-        understands_user_intent: Some(crate::todo::IntentUnderstanding::from_legacy_score(80)),
+        understands_user_intent: Some(crate::todo::IntentUnderstanding::Partial),
         ..Default::default()
     };
     let after = crate::todo::TodoPlan {
-        understands_user_intent: Some(crate::todo::IntentUnderstanding::from_legacy_score(97)),
+        understands_user_intent: Some(crate::todo::IntentUnderstanding::Clear),
         ..before.clone()
     };
     let update = crate::todo::TodoPlanChange {
@@ -2370,7 +2434,7 @@ fn unbiased_visual_prompt_retry_renders_complete_feedback_change() {
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: Some("pelican-bike-animation".to_string()),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(90)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         ..Default::default()
     }];
     let render = |goal: crate::todo::TodoGoal,
@@ -2379,7 +2443,7 @@ fn unbiased_visual_prompt_retry_renders_complete_feedback_change() {
                   tool_data: Option<crate::message::ToolCall>| {
         let plan = crate::todo::TodoPlan {
             user_intention: Some(intention.to_string()),
-            understands_user_intent: Some(crate::todo::IntentUnderstanding::from_legacy_score(96)),
+            understands_user_intent: Some(crate::todo::IntentUnderstanding::Clear),
             ..Default::default()
         };
         let mut content = format!(
@@ -2410,7 +2474,7 @@ fn unbiased_visual_prompt_retry_renders_complete_feedback_change() {
     let initial = render(
         crate::todo::TodoGoal {
             group: Some("pelican-bike-animation".to_string()),
-            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(90)),
+            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Strong),
             feedback_loop: Some(INITIAL_FEEDBACK.to_string()),
             ..Default::default()
         },
@@ -2433,7 +2497,7 @@ fn unbiased_visual_prompt_retry_renders_complete_feedback_change() {
     let revised = render(
         crate::todo::TodoGoal {
             group: Some("pelican-bike-animation".to_string()),
-            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(98)),
+            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
             feedback_loop: Some(REVISED_FEEDBACK.to_string()),
             ..Default::default()
         },
@@ -2473,19 +2537,19 @@ fn visually_appealing_prompt_batched_retry_renders_complete_todo_card() {
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: Some("pelican-bike".to_string()),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(95)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         ..Default::default()
     }];
     let goals = vec![crate::todo::TodoGoal {
         group: Some("pelican-bike".to_string()),
-        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(98)),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
         feedback_loop: Some(FEEDBACK.to_string()),
         feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
         ..Default::default()
     }];
     let plan = crate::todo::TodoPlan {
         user_intention: Some(OBJECTIVE.to_string()),
-        understands_user_intent: Some(crate::todo::IntentUnderstanding::from_legacy_score(97)),
+        understands_user_intent: Some(crate::todo::IntentUnderstanding::Clear),
         ..Default::default()
     };
     let todo_output = format!(
@@ -2572,17 +2636,17 @@ fn render_ownership_gated_todo_result_keeps_the_full_card() {
         status: "in_progress".to_string(),
         priority: "high".to_string(),
         group: Some("ship outcome".to_string()),
-        confidence: Some(crate::todo::ConfidenceState::from_legacy_score(95)),
+        confidence: Some(crate::todo::ConfidenceState::Plausible),
         ..Default::default()
     }];
     let goals = vec![crate::todo::TodoGoal {
         group: Some("ship outcome".to_string()),
-        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(100)),
+        closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
         feedback_loop: Some("Run the complete workflow".to_string()),
         feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
         feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
         feedback_loop_traceability: Some(crate::todo::FeedbackLoopTraceability::Complete),
-        delivery_state: Some(crate::todo::DeliveryState::from_legacy_score(80)),
+        delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
         ..Default::default()
     }];
     let content = format!(
@@ -2615,7 +2679,7 @@ fn render_ownership_gated_todo_result_keeps_the_full_card() {
     assert!(plain.contains("ship outcome  ●"), "{plain}");
     assert!(plain.contains("Deliver the complete workflow"), "{plain}");
     assert!(plain.contains("✓ All quality gates passing"), "{plain}");
-    assert!(!plain.contains("Delivery "), "{plain}");
+    assert!(plain.contains("Delivery partially_delivered"), "{plain}");
     assert!(!plain.contains("todo 1 items"), "{plain}");
 }
 
@@ -3002,14 +3066,14 @@ fn render_swarm_message_collapsed_shows_tldr_and_expand_badge_only() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(plain.contains("fixed the flaky test"), "{plain}");
-    assert!(plain.contains(super::SWARM_EXPAND_BADGE), "{plain}");
+    assert!(!plain.contains("fixed the flaky test"), "{plain}");
+    assert!(plain.contains("tok"), "{plain}");
     let preview = lines
         .iter()
         .flat_map(|line| &line.spans)
-        .find(|span| span.content.contains("fixed the flaky test"))
-        .expect("DM preview span");
-    assert_eq!(preview.style.fg, Some(rgb(130, 130, 140)));
+        .find(|span| span.content.contains("tok"))
+        .expect("DM token count span");
+    assert_eq!(preview.style.fg, Some(rgb(118, 118, 118)));
     assert!(
         !plain.contains("race in the setup helper"),
         "collapsed card must hide the full body: {plain}"
@@ -3592,3 +3656,9 @@ mod discovery_cards;
 
 #[path = "tool_render_tests.rs"]
 mod tool_render;
+
+#[path = "provider_card_tests.rs"]
+mod provider_card_tests;
+
+#[path = "tests_additional_tests.rs"]
+mod additional_pinned_dependency_label_uses_available_width_and_palette;

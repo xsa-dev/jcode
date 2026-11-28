@@ -11,6 +11,85 @@ use std::sync::Arc;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+fn run_delivery_goal(group: &str) -> crate::todo::TodoGoal {
+    crate::todo::TodoGoal {
+        group: Some(group.into()),
+        delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn run_delivery_continues_empty_and_completed_snapshots_without_quality_review() {
+    let mut completed = test_todo("ship", "completed", "high", None, None);
+    completed.group = Some("ship".into());
+    for todos in [vec![], vec![completed]] {
+        let mut budget = todo_followup::RunDeliveryBudget::default();
+        let goals = || vec![run_delivery_goal("ship")];
+        let message = crate::todo::undelivered_goal_message(&todos, &goals()).unwrap();
+        assert_eq!(
+            budget.follow_up(&todos, goals, true),
+            Some(Err("turn_limit"))
+        );
+        assert_eq!(budget.follow_up(&todos, goals, false), Some(Ok(message)));
+        assert_eq!(
+            budget.follow_up(&todos, goals, false),
+            Some(Err("unchanged_delivery"))
+        );
+        let mut goal = run_delivery_goal("ship");
+        goal.delivery_state = Some(crate::todo::DeliveryState::Delivered);
+        assert_eq!(budget.follow_up(&todos, || vec![goal], false), None);
+    }
+}
+
+#[test]
+fn run_delivery_defers_to_open_work_and_bounds_changing_messages() {
+    let mut budget = todo_followup::RunDeliveryBudget::default();
+    let open = dependency_todo("waiting", &["task"]);
+    assert_eq!(
+        budget.follow_up(&[open], || panic!("open work takes precedence"), false),
+        None
+    );
+    for i in 0..crate::todo::INCOMPLETE_TODO_MAX_ATTEMPTS {
+        assert!(matches!(
+            budget.follow_up(&[], || vec![run_delivery_goal(&i.to_string())], false),
+            Some(Ok(_))
+        ));
+    }
+    assert_eq!(
+        budget.follow_up(&[], || vec![run_delivery_goal("new")], false),
+        Some(Err("delivery_attempt_limit"))
+    );
+}
+
+#[test]
+fn run_auto_poke_default_skips_quality_reviews_but_keeps_unfinished_work() {
+    let mut spiked = test_todo(
+        "a",
+        "completed",
+        "high",
+        Some(ConfidenceState::Speculative),
+        Some(ConfidenceState::Verified),
+    );
+    spiked.confidence_history = vec![ConfidenceState::Speculative, ConfidenceState::Verified];
+    for todo in [spiked, test_todo("b", "completed", "high", None, None)] {
+        assert!(
+            build_run_auto_poke_follow_up_from_todos(
+                false,
+                &[todo],
+                false,
+                Some("stale digest".into())
+            )
+            .is_none()
+        );
+    }
+    let open = test_todo("open", "pending", "high", None, None);
+    assert!(matches!(
+        build_run_auto_poke_follow_up_from_todos(false, &[open], false, None),
+        Some(RunAutoPokeFollowUp::Incomplete { .. })
+    ));
+}
+
 #[test]
 fn run_report_names_local_profile_instead_of_openrouter_slot() {
     // Ollama/LM Studio share the OpenRouter transport slot (#804).
@@ -261,24 +340,22 @@ fn dependency_todo(id: &str, dependencies: &[&str]) -> crate::todo::TodoItem {
 }
 
 #[tokio::test]
-async fn completely_blocked_cli_pauses_without_review_and_keeps_peers_actionable() {
+async fn user_auth_cli_pauses_only_that_todo_and_keeps_peers_actionable() {
     let temp = tempfile::tempdir().unwrap();
     let manager = crate::background::BackgroundTaskManager::with_output_dir(temp.path().into());
     let mut blocked = dependency_todo("blocked", &[]);
-    blocked.completely_blocked = Some(crate::todo::TodoCompleteBlocker {
+    blocked.requires_user_auth = Some(crate::todo::TodoUserAuth {
         reason: "Required source data no longer exists".into(),
     });
     let (actionable, resumed) =
         prepare_run_todo_follow_up(&manager, "owner", &[blocked.clone()], true).await;
     assert!(actionable.is_empty());
     assert!(resumed.is_none());
-    let notice = run_blocked_notice(&[blocked.clone()]).unwrap();
+    let notice = run_blocked_notice(&[blocked.clone()], &[]).unwrap();
     assert_eq!(
         notice,
-        "✋ Completely blocked. No way forward.\nblocked: Required source data no longer exists"
+        "✋ Needs your login.\nblocked: Required source data no longer exists"
     );
-    assert!(!notice.contains("review deadline"));
-    assert!(run_external_blocker_notice(&[blocked.clone()]).is_none());
 
     let independent = dependency_todo("independent", &[]);
     let all = vec![blocked.clone(), independent];
@@ -289,66 +366,42 @@ async fn completely_blocked_cli_pauses_without_review_and_keeps_peers_actionable
     assert!(poke.contains("independent"));
     assert!(!poke.contains("Required source data"));
 
-    blocked.completely_blocked = None;
+    blocked.requires_user_auth = None;
     let (actionable, _) =
         prepare_run_todo_follow_up(&manager, "owner", &[blocked.clone()], true).await;
     assert_eq!(actionable.len(), 1);
     assert_eq!(actionable[0].status, "pending");
-    assert!(run_completely_blocked_notice(&[blocked]).is_none());
+    assert!(run_user_auth_notice(&[blocked]).is_none());
 }
 
 #[test]
-fn completely_blocked_cli_ignores_terminal_tasks_and_keeps_external_notice() {
+fn cli_notice_reports_user_auth_and_goal_that_cannot_complete() {
     let mut blocked = dependency_todo("blocked", &[]);
-    blocked.completely_blocked = Some(crate::todo::TodoCompleteBlocker {
-        reason: "Required source data no longer exists".into(),
+    blocked.requires_user_auth = Some(crate::todo::TodoUserAuth {
+        reason: "Log in to the deploy dashboard".into(),
     });
-    let mut external = dependency_todo("service", &[]);
-    external.external_blocker = Some(crate::todo::TodoExternalBlocker {
-        reason: "Service is unavailable".into(),
-        review_at: chrono::Utc::now() + chrono::Duration::minutes(10),
-    });
-    let notice = run_blocked_notice(&[blocked.clone(), external]).unwrap();
-    assert!(notice.contains("Completely blocked. No way forward."));
-    assert!(notice.contains("Service is unavailable"));
+    let mut abandoned = dependency_todo("service", &[]);
+    abandoned.group = Some("migration".into());
+    let goals = vec![crate::todo::TodoGoal {
+        group: Some("migration".into()),
+        cannot_complete: Some("Source data was deleted upstream".into()),
+        ..Default::default()
+    }];
+    // The declared goal covers only its own group's todos.
+    assert!(run_cannot_complete_notice(&[blocked.clone()], &goals).is_none());
+    let notice = run_blocked_notice(&[blocked.clone(), abandoned.clone()], &goals).unwrap();
+    assert!(notice.contains("Needs your login."));
+    assert!(notice.contains("Goal cannot be completed."));
+    assert!(notice.contains("Source data was deleted upstream"));
     for status in ["completed", "cancelled"] {
         blocked.status = status.into();
-        assert!(run_completely_blocked_notice(&[blocked.clone()]).is_none());
+        abandoned.status = status.into();
+        assert!(run_blocked_notice(&[blocked.clone(), abandoned.clone()], &goals).is_none());
         assert_eq!(
             run_actionable_todos(&[blocked.clone()], &[], "owner").len(),
             1
         );
     }
-}
-
-#[tokio::test]
-async fn external_blocker_cli_suppresses_only_blocked_work_and_reports_durable_review() {
-    let temp = tempfile::tempdir().unwrap();
-    let manager = crate::background::BackgroundTaskManager::with_output_dir(temp.path().into());
-    let mut blocked = dependency_todo("acceptance", &[]);
-    blocked.external_blocker = Some(crate::todo::TodoExternalBlocker {
-        reason: "Coordinator acceptance".into(),
-        review_at: chrono::Utc::now() + chrono::Duration::minutes(10),
-    });
-    let (actionable, resumed) =
-        prepare_run_todo_follow_up(&manager, "owner", &[blocked.clone()], true).await;
-    assert!(actionable.is_empty());
-    assert!(resumed.is_none(), "durable scheduler owns the review wake");
-    let notice = run_external_blocker_notice(&[blocked.clone()]).unwrap();
-    assert!(notice.contains("Coordinator acceptance") && notice.contains("review"));
-    let mixed = vec![blocked.clone(), dependency_todo("independent", &[])];
-    let (actionable, _) = prepare_run_todo_follow_up(&manager, "owner", &mixed, true).await;
-    assert_eq!(actionable.len(), 1);
-    assert_eq!(actionable[0].id, "independent");
-    blocked.external_blocker.as_mut().unwrap().review_at =
-        chrono::Utc::now() - chrono::Duration::seconds(1);
-    let (actionable, _) = prepare_run_todo_follow_up(&manager, "owner", &[blocked], true).await;
-    assert_eq!(
-        actionable.len(),
-        1,
-        "deadline restores reassessment, never completes"
-    );
-    assert_eq!(actionable[0].status, "pending");
 }
 
 #[tokio::test]
@@ -429,7 +482,7 @@ async fn run_dependency_mixed_work_stays_actionable_and_scoped() {
     assert!(resumed.is_none());
     assert_eq!(actionable.len(), 1);
     assert_eq!(actionable[0].id, "independent");
-    let followup = build_run_auto_poke_follow_up_from_todos(&actionable, false, None);
+    let followup = build_run_auto_poke_follow_up_from_todos(true, &actionable, false, None);
     let Some(RunAutoPokeFollowUp::Incomplete { count, message }) = followup else {
         panic!("independent work must remain actionable");
     };
@@ -642,7 +695,7 @@ fn run_auto_poke_followup_targets_below_threshold_todos() {
         ),
     ];
 
-    let followup = build_run_auto_poke_follow_up_from_todos(&todos, false, None);
+    let followup = build_run_auto_poke_follow_up_from_todos(true, &todos, false, None);
 
     match followup {
         Some(RunAutoPokeFollowUp::ConfidenceSummary {
@@ -673,7 +726,7 @@ fn run_auto_poke_followup_challenges_abrupt_confidence_once() {
     todo.confidence_history = vec![ConfidenceState::Speculative, ConfidenceState::Verified];
 
     let todos = [todo];
-    match build_run_auto_poke_follow_up_from_todos(&todos, false, None) {
+    match build_run_auto_poke_follow_up_from_todos(true, &todos, false, None) {
         Some(RunAutoPokeFollowUp::ConfidenceSummary {
             message,
             confidence_spike_challenge,
@@ -684,7 +737,7 @@ fn run_auto_poke_followup_challenges_abrupt_confidence_once() {
         }
         _ => panic!("expected confidence-spike challenge"),
     }
-    assert!(build_run_auto_poke_follow_up_from_todos(&todos, true, None).is_none());
+    assert!(build_run_auto_poke_follow_up_from_todos(true, &todos, true, None).is_none());
 }
 
 #[test]
@@ -716,7 +769,7 @@ fn run_auto_poke_followup_silent_when_confident_and_earned() {
             Some(ConfidenceState::Validated),
         ),
     ];
-    assert!(build_run_auto_poke_follow_up_from_todos(&todos, false, None).is_none());
+    assert!(build_run_auto_poke_follow_up_from_todos(true, &todos, false, None).is_none());
 }
 
 #[test]
@@ -738,7 +791,7 @@ fn run_auto_poke_followup_prioritizes_incomplete_todos() {
         ),
     ];
 
-    let followup = build_run_auto_poke_follow_up_from_todos(&todos, false, None);
+    let followup = build_run_auto_poke_follow_up_from_todos(true, &todos, false, None);
 
     match followup {
         Some(RunAutoPokeFollowUp::Incomplete { count, message }) => {
@@ -763,7 +816,7 @@ fn run_auto_poke_treats_completion_synonyms_and_case_as_finished() {
             Some(ConfidenceState::Verified),
         )];
         assert!(
-            build_run_auto_poke_follow_up_from_todos(&todos, false, None).is_none(),
+            build_run_auto_poke_follow_up_from_todos(true, &todos, false, None).is_none(),
             "status {status:?} should not trigger an incomplete-todo poke"
         );
     }
@@ -774,7 +827,7 @@ fn run_auto_poke_treats_cancelled_spelling_variants_as_finished() {
     for status in ["cancelled", "canceled", "Cancelled"] {
         let todos = vec![test_todo("a", status, "high", None, None)];
         assert!(
-            build_run_auto_poke_follow_up_from_todos(&todos, false, None).is_none(),
+            build_run_auto_poke_follow_up_from_todos(true, &todos, false, None).is_none(),
             "status {status:?} should not trigger an incomplete-todo poke"
         );
     }
@@ -793,12 +846,13 @@ fn run_auto_poke_delivers_the_deferred_gate_digest_before_confidence() {
     )];
     // Without a digest, the confidence gate is what fires.
     assert!(matches!(
-        build_run_auto_poke_follow_up_from_todos(&todos, false, None),
+        build_run_auto_poke_follow_up_from_todos(true, &todos, false, None),
         Some(RunAutoPokeFollowUp::ConfidenceSummary { .. })
     ));
     // With one, the weak points are reviewed first, since that work can change
     // the very assessments the confidence gate judges.
     match build_run_auto_poke_follow_up_from_todos(
+        true,
         &todos,
         false,
         Some("review these points".to_string()),
@@ -823,6 +877,7 @@ fn run_auto_poke_prefers_incomplete_todos_over_the_gate_digest() {
     )];
     assert!(matches!(
         build_run_auto_poke_follow_up_from_todos(
+            true,
             &todos,
             false,
             Some("review these points".to_string())
@@ -862,6 +917,7 @@ fn open_todos_do_not_consume_the_pending_gate_digest() {
     )];
     assert!(matches!(
         build_run_auto_poke_follow_up_from_todos(
+            true,
             &open,
             false,
             take_run_gate_digest_if_turn_ended(session, false, &open, true),
@@ -884,6 +940,7 @@ fn open_todos_do_not_consume_the_pending_gate_digest() {
         Some(ConfidenceState::Verified),
     )];
     match build_run_auto_poke_follow_up_from_todos(
+        true,
         &done,
         false,
         take_run_gate_digest_if_turn_ended(session, false, &done, true),
@@ -972,11 +1029,11 @@ fn run_auto_poke_followup_rechecks_completion_confidence_until_it_passes() {
         Some(ConfidenceState::Plausible),
     )];
     assert!(matches!(
-        build_run_auto_poke_follow_up_from_todos(&needs_validation, false, None),
+        build_run_auto_poke_follow_up_from_todos(true, &needs_validation, false, None),
         Some(RunAutoPokeFollowUp::ConfidenceSummary { .. })
     ));
     assert!(matches!(
-        build_run_auto_poke_follow_up_from_todos(&needs_validation, false, None),
+        build_run_auto_poke_follow_up_from_todos(true, &needs_validation, false, None),
         Some(RunAutoPokeFollowUp::ConfidenceSummary { .. })
     ));
 
@@ -988,8 +1045,8 @@ fn run_auto_poke_followup_rechecks_completion_confidence_until_it_passes() {
         Some(ConfidenceState::Verified),
     )];
     // A normal validation gain is not a reason to spend another model turn.
-    assert!(build_run_auto_poke_follow_up_from_todos(&validated, false, None).is_none());
-    assert!(build_run_auto_poke_follow_up_from_todos(&validated, true, None).is_none());
+    assert!(build_run_auto_poke_follow_up_from_todos(true, &validated, false, None).is_none());
+    assert!(build_run_auto_poke_follow_up_from_todos(true, &validated, true, None).is_none());
 }
 
 #[test]
@@ -1140,9 +1197,9 @@ async fn auth_test_choice_plan_discovers_model_for_hosted_custom_compat_endpoint
         "NO_PROXY",
         "no_proxy",
     ]);
-    // 0.0.0.0 is accepted as an insecure HTTP test host but is not treated as
-    // localhost by resolve_openai_compatible_profile, so this exercises the
-    // hosted/API-key code path while still serving the response locally.
+    // Since #2018 a bare IP host is treated like loopback, so the profile
+    // needs no API key by default. A configured key must still be sent, so
+    // this checks model discovery with a key against a bare-IP endpoint.
     let api_base = spawn_single_response_http_server_on_host(
         "0.0.0.0",
         200,
@@ -1159,7 +1216,7 @@ async fn auth_test_choice_plan_discovers_model_for_hosted_custom_compat_endpoint
     let resolved = crate::provider_catalog::resolve_openai_compatible_profile(
         crate::provider_catalog::OPENAI_COMPAT_PROFILE,
     );
-    assert!(resolved.requires_api_key);
+    assert!(!resolved.requires_api_key);
 
     let plan = auth_test_choice_plan(
         &super::super::provider_init::ProviderChoice::OpenaiCompatible,
@@ -1312,6 +1369,15 @@ async fn restore_agent_session_if_requested_restores_resumed_session() {
 
 #[tokio::test]
 async fn incomplete_todo_followups_stop_after_three_in_all_output_modes() {
+    check_followup_dispatch_all_modes(false).await;
+}
+
+#[tokio::test]
+async fn run_delivery_pokes_once_for_goal_without_items_in_all_output_modes() {
+    check_followup_dispatch_all_modes(true).await;
+}
+
+async fn check_followup_dispatch_all_modes(goal_only: bool) {
     let _guard = crate::storage::lock_test_env();
     let _saved = SavedEnv::capture(&[
         "JCODE_HOME",
@@ -1328,24 +1394,27 @@ async fn incomplete_todo_followups_stop_after_three_in_all_output_modes() {
             let provider: Arc<dyn Provider> = Arc::new(TestProvider);
             let registry = Registry::new(provider.clone()).await;
             let mut agent = crate::agent::Agent::new(provider.clone(), registry);
-            crate::todo::save_todos(
-                agent.session_id(),
-                &[test_todo("open", "pending", "high", None, None)],
-            )
-            .unwrap();
-            match mode {
-                "plain" => run_single_message_command_plain_with_auto_poke(&mut agent, "go")
-                    .await
-                    .unwrap(),
-                "capture" => {
-                    run_single_message_command_capture_with_auto_poke(&mut agent, "go")
-                        .await
-                        .unwrap();
-                }
-                _ => run_single_message_command_ndjson(&mut agent, provider, "go")
-                    .await
-                    .unwrap(),
+            if goal_only {
+                crate::todo::save_goals(agent.session_id(), &[run_delivery_goal("ship")]).unwrap();
+            } else {
+                crate::todo::save_todos(
+                    agent.session_id(),
+                    &[test_todo("open", "pending", "high", None, None)],
+                )
+                .unwrap();
             }
+            // Exercise the actual CLI output dispatcher, not only the local
+            // loop helpers. Daemon-owned continuation must not accidentally
+            // disable this standalone Agent's follow-ups in any output mode.
+            run_single_message_with_agent(
+                &mut agent,
+                provider,
+                "go",
+                mode == "capture",
+                mode == "ndjson",
+            )
+            .await
+            .unwrap();
             let session = crate::session::Session::load(agent.session_id()).unwrap();
             let followups = session
                 .messages
@@ -1362,8 +1431,12 @@ async fn incomplete_todo_followups_stop_after_three_in_all_output_modes() {
                 .count();
             assert_eq!(
                 followups,
-                if enabled { 3 } else { 0 },
-                "{mode}, enabled={enabled}"
+                match (enabled, goal_only) {
+                    (false, _) => 0,
+                    (true, true) => 1,
+                    (true, false) => 3,
+                },
+                "{mode}, enabled={enabled}, goal_only={goal_only}"
             );
         }
     }

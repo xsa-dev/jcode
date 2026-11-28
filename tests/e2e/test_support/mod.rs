@@ -378,6 +378,7 @@ impl WsTestClient {
             selfdev: None,
             target_session_id: None,
             client_instance_id: None,
+            client_name: None,
             client_has_local_history: false,
             allow_session_takeover: false,
             terminal_env: Vec::new(),
@@ -396,6 +397,7 @@ impl WsTestClient {
         self.next_id += 1;
         self.send_request(Request::Message {
             id,
+            jarvis_voice: false,
             content: content.to_string(),
             images: vec![],
             system_reminder: None,
@@ -412,6 +414,7 @@ impl WsTestClient {
             id,
             session_id: session_id.to_string(),
             client_instance_id: None,
+            client_name: None,
             client_has_local_history: false,
             allow_session_takeover: false,
         })

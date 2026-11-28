@@ -14,6 +14,7 @@ pub(in crate::tui::app) async fn send_interleave_now(
         return;
     }
     let msg_clone = content.clone();
+    let images_clone = images.clone();
     match remote.soft_interrupt(content, images, false).await {
         Err(e) => {
             app.push_display_message(DisplayMessage::error(format!(
@@ -22,7 +23,7 @@ pub(in crate::tui::app) async fn send_interleave_now(
             )));
         }
         Ok(request_id) => {
-            app.track_pending_soft_interrupt(request_id, msg_clone);
+            app.track_pending_soft_interrupt_with_images(request_id, msg_clone, images_clone);
             app.set_status_notice("⏭ Interleave sent");
         }
     }
@@ -31,18 +32,21 @@ pub(in crate::tui::app) async fn send_interleave_now(
 pub(in crate::tui::app) async fn handle_remote_update_command(
     app: &mut App,
     remote: &mut RemoteConnection,
+    explicit_channel: Option<crate::config::UpdateChannel>,
 ) -> Result<()> {
     if crate::tui::is_ssh_remote() {
         app.set_status_notice("Update the client and SSH server separately, then reconnect");
         return Ok(());
     }
-    reload_stale_remote_server_before_update(app, remote).await?;
+    if explicit_channel.is_none() {
+        reload_stale_remote_server_before_update(app, remote).await?;
+    }
 
     let session_id = app
         .remote_session_id
         .clone()
         .unwrap_or_else(|| crate::id::new_id("ses"));
-    app.start_background_client_update(session_id);
+    app.start_background_client_update_with_channel(session_id, explicit_channel);
     Ok(())
 }
 

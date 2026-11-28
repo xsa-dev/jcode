@@ -5,7 +5,7 @@ use crate::message::{ContentBlock, Role, ToolCall};
 use crate::session::{Session, StoredMessage};
 use std::time::Instant;
 
-pub(super) fn review_session_read_only_guardrails() -> &'static str {
+fn review_session_read_only_guardrails() -> &'static str {
     "Important constraints for this session:\n\
 - This session is analysis-only. Do not do the work yourself.\n\
 - Do not modify files or repo state. Do not call `edit`, `write`, `multiedit`, `patch`, `apply_patch`, or destructive `bash`/`git` commands.\n\
@@ -68,7 +68,8 @@ fn judge_transcript_text_message(role: Role, text: String) -> StoredMessage {
         content: vec![ContentBlock::Text {
             text,
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -322,6 +323,7 @@ pub(super) fn reset_current_session(app: &mut App) {
     app.swarm_plan_version = None;
     app.swarm_plan_swarm_id = None;
     app.queued_messages.clear();
+    app.queued_images.clear();
     app.queued_commands.clear();
     app.pasted_contents.clear();
     app.pending_images.clear();
@@ -796,7 +798,7 @@ pub(super) fn launch_forked_session_local(
     Ok(opened)
 }
 
-pub(super) fn launch_review_window_local(
+fn launch_review_window_local(
     app: &mut App,
     session_title: &str,
     label: &str,

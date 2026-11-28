@@ -15,8 +15,8 @@ pub mod store;
 pub use followup::{
     ConfidenceSummary, Decision, FollowUp, FollowUpKind, FollowUpPolicy,
     INCOMPLETE_TODO_MAX_ATTEMPTS, IncompleteTodoBudget, MAX_GATE_ATTEMPTS, TodoEffects,
-    TodoSnapshot, is_incomplete_todo, todo_completely_blocked, todo_has_external_blocker,
-    todo_has_external_blocker_at, todo_waits_on_running_task,
+    TodoSnapshot, goal_cannot_complete, is_incomplete_todo, todo_cannot_complete_reason,
+    todo_goal_cannot_complete, todo_requires_user_auth, todo_waits_on_running_task,
 };
 
 /// Generic mid-task reassessment prompt. The elapsed-time policy that triggers
@@ -34,8 +34,8 @@ pub const TODO_QUALITY_GATE_MAX_APPROX_TOKENS: usize = 64;
 pub use jcode_task_types::{
     Autonomy, ConfidenceState, DeliveryState, Difficulty, FeedbackLoopCoverage,
     FeedbackLoopRelevance, FeedbackLoopState, FeedbackLoopTraceability, IntentUnderstanding,
-    IterationMaturity, TodoCompleteBlocker, TodoExternalBlocker, TodoGoal, TodoGoalChange,
-    TodoGoalField, TodoItem, TodoPlan, TodoPlanChange, TodoPlanField,
+    IterationMaturity, LANE_OWNER_WORKER, TodoGoal, TodoGoalChange, TodoGoalField, TodoItem,
+    TodoPlan, TodoPlanChange, TodoPlanField, TodoUserAuth, VerificationState,
 };
 
 /// Return the canonical todo status for model-written status vocabulary.
@@ -135,11 +135,10 @@ pub fn completion_confidence_passes(state: Option<ConfidenceState>) -> bool {
     state.is_some_and(|state| state >= ConfidenceState::Validated)
 }
 
-/// The minimum delivery state for a completed goal. Outcome delivery is only
-/// appropriate when the request itself includes operational delivery, so it
-/// must not be inferred from difficulty.
+/// Only delivery of the requested outcome clears the delivery gap, regardless
+/// of difficulty or verification.
 pub fn required_delivery_state(_difficulty: Option<Difficulty>) -> DeliveryState {
-    DeliveryState::WorkflowValidated
+    DeliveryState::Delivered
 }
 
 /// Whether a completed goal's delivery and validation clear their
@@ -210,7 +209,9 @@ const PRE_COMPACT_TODO_OWNERSHIP_CONTINUATION_MESSAGE: &str = "[automated follow
 /// `delivery_state_passes`. Missing metadata is not evidence of unfinished work,
 /// and staying within the requested scope is not a failure of ownership. The
 /// deferred feedback-loop review already handles validation-quality concerns.
-fn ownership_followup_reasons(goal: &TodoGoal) -> Vec<&'static str> {
+/// Whether the goal records a deliberate stop (confirmed plateau, exhausted
+/// constraints or budget) together with the evidence for it.
+fn goal_has_documented_stop(goal: &TodoGoal) -> bool {
     let stopped = matches!(
         goal.iteration_maturity,
         Some(
@@ -223,10 +224,45 @@ fn ownership_followup_reasons(goal: &TodoGoal) -> Vec<&'static str> {
         .stopping_evidence
         .as_deref()
         .is_some_and(|evidence| !evidence.trim().is_empty());
+    stopped && has_stopping_evidence
+}
+
+/// Completed todos that still merit a "validate further" follow-up.
+///
+/// A todo qualifies when its completion confidence is missing or below the
+/// passing bar, unless its group's goal documents why validation stopped. More
+/// turns cannot lift an exhausted constraint, so asking again only loops: a
+/// session was nudged "Validate further" every few seconds for an item already
+/// marked `constraints_exhausted` with stopping evidence.
+pub fn todos_needing_validation<'a>(
+    todos: &'a [TodoItem],
+    goals: &[TodoGoal],
+) -> Vec<&'a TodoItem> {
+    todos
+        .iter()
+        .filter(|todo| todo_status_is_completed(&todo.status))
+        .filter(|todo| !completion_confidence_passes(todo.completion_confidence))
+        .filter(|todo| {
+            let group = normalized_group(todo.group.as_deref());
+            !goals.iter().any(|goal| {
+                normalized_group(goal.group.as_deref()) == group && goal_has_documented_stop(goal)
+            })
+        })
+        .collect()
+}
+
+/// Follow-up naming exactly the given completed todos as needing validation.
+pub fn build_todo_validation_continuation_message(targets: &[&TodoItem]) -> String {
+    let mut message = String::from(TODO_COMPLETION_CONTINUATION_MESSAGE);
+    append_named_todos(&mut message, "Validate further:", targets);
+    message
+}
+
+fn ownership_followup_reasons(goal: &TodoGoal) -> Vec<&'static str> {
     // More autonomous work cannot remove an explicitly documented constraint
     // or exhausted budget. Preserve the honest assessment instead of demanding
     // a higher score or repeatedly asking for the unavailable acceptance path.
-    if stopped && has_stopping_evidence {
+    if goal_has_documented_stop(goal) || goal_cannot_complete(goal).is_some() {
         return Vec::new();
     }
 
@@ -235,7 +271,7 @@ fn ownership_followup_reasons(goal: &TodoGoal) -> Vec<&'static str> {
         .delivery_state
         .is_some_and(|state| state < required_delivery_state(goal.difficulty))
     {
-        reasons.push("carry the work through the complete workflow.");
+        reasons.push("deliver the requested outcome.");
     }
     if goal
         .iteration_maturity
@@ -243,10 +279,55 @@ fn ownership_followup_reasons(goal: &TodoGoal) -> Vec<&'static str> {
     {
         reasons.push("keep iterating and test the remaining hypotheses.");
     }
-    if stopped && !has_stopping_evidence {
+    // A documented stop returned above, so a stop reaching here lacks evidence.
+    let stopped = matches!(
+        goal.iteration_maturity,
+        Some(
+            IterationMaturity::PlateauConfirmed
+                | IterationMaturity::ConstraintsExhausted
+                | IterationMaturity::BudgetExhausted
+        )
+    );
+    if stopped {
         reasons.push("gather more evidence about whether the work should stop.");
     }
     reasons
+}
+
+/// An explicit undelivered goal is actionable without opting into quality
+/// reviews. A goal may precede its first todo or outlive its last attempt.
+pub fn undelivered_goal_message(todos: &[TodoItem], goals: &[TodoGoal]) -> Option<String> {
+    let mut gaps = Vec::new();
+    for goal in goals {
+        let Some(state) = goal.delivery_state else {
+            continue;
+        };
+        if state == DeliveryState::Delivered || goal_cannot_complete(goal).is_some() {
+            continue;
+        }
+        let group = normalized_group(goal.group.as_deref());
+        let matching = todos
+            .iter()
+            .filter(|t| normalized_group(t.group.as_deref()) == group);
+        // Respect live/paused todos and deliberate cancellation. A mixture
+        // of finished and cancelled attempts does not retire a live goal.
+        if matching.clone().any(is_incomplete_todo)
+            || (matching.clone().next().is_some()
+                && matching
+                    .into_iter()
+                    .all(|t| todo_status_is_cancelled(&t.status)))
+        {
+            continue;
+        }
+        gaps.push(format!(
+            "\n- Goal \"{}\" ({}): the requested outcome is still undelivered. Add or reopen a concrete next action within the user's request. If the requested outcome is already delivered, record the evidence instead.",
+            group.as_deref().unwrap_or("ungrouped goal"),
+            state.as_str()
+        ));
+    }
+    gaps.sort_unstable();
+    gaps.dedup();
+    (!gaps.is_empty()).then(|| format!("{TODO_OWNERSHIP_CONTINUATION_MESSAGE}{}", gaps.concat()))
 }
 
 /// Build an ownership continuation that directs work toward each affected goal
@@ -667,7 +748,15 @@ pub fn build_actionable_poke_message(actionable: &[TodoItem]) -> String {
     for todo in actionable.iter().take(GATE_NAMED_TODO_LIMIT) {
         // Names are the public lookup key. Keep the full, escaped name rather
         // than an internal ID or a truncated label the model cannot reference.
-        message.push_str(&format!("\n- {}", serde_json::json!(todo.content)));
+        if todo.waiting_on.is_empty() {
+            message.push_str(&format!("\n- {}", serde_json::json!(todo.content)));
+        } else {
+            message.push_str(&format!(
+                "\n- {} (waiting_on: {}, no longer running)",
+                serde_json::json!(todo.content),
+                todo.waiting_on.join(", ")
+            ));
+        }
     }
     if actionable.len() > GATE_NAMED_TODO_LIMIT {
         message.push_str(&format!(

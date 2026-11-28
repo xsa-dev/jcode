@@ -361,7 +361,7 @@ fn omitted_goal_fields_inherit_the_stored_assessment() {
             feedback_loop: Some("cargo bench".to_string()),
             feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
             feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
-            delivery_state: Some(crate::todo::DeliveryState::OutcomeDelivered),
+            delivery_state: Some(crate::todo::DeliveryState::Delivered),
             ..Default::default()
         }]),
     );
@@ -387,7 +387,7 @@ fn omitted_goal_fields_inherit_the_stored_assessment() {
     );
     assert_eq!(
         merged[0].delivery_state,
-        Some(crate::todo::DeliveryState::OutcomeDelivered)
+        Some(crate::todo::DeliveryState::Delivered)
     );
 }
 
@@ -403,8 +403,8 @@ fn garbage_string_still_errors() {
 fn pre_rename_hill_climbability_keys_still_load() {
     let goal: crate::todo::TodoGoal = serde_json::from_value(json!({
         "group": "optimize grep",
-        "hill_climbability": 91,
-        "hill_climbability_history": [70, 91],
+        "hill_climbability": "strong",
+        "hill_climbability_history": ["usable", "strong"],
         "feedback_loop": "cargo bench grep"
     }))
     .expect("the pre-rename key must still deserialize");
@@ -420,8 +420,10 @@ fn pre_rename_hill_climbability_keys_still_load() {
         ]
     );
 
+    assert_eq!(goal.delivery_state, None);
+
     let goals = parse(json!({
-        "goals": [{"group": "optimize grep", "hill_climbability": "88", "feedback_loop": "bench"}]
+        "goals": [{"delivery_state": "not_started", "group": "optimize grep", "hill_climbability": "strong", "feedback_loop": "bench"}]
     }))
     .expect("a pre-rename tool call must still parse")
     .goals

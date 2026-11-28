@@ -39,8 +39,8 @@ async fn background_dependencies_validate_session_and_arm_wake() {
         })
         .await;
     let item = TodoItem {
-        completely_blocked: None,
-        external_blocker: None,
+        requires_user_auth: None,
+        waiting_reason: None,
         waiting_on: vec![task.task_id.clone()],
         ..Default::default()
     };
@@ -55,8 +55,8 @@ async fn background_dependencies_validate_session_and_arm_wake() {
         .is_err()
     );
     let unknown = TodoItem {
-        completely_blocked: None,
-        external_blocker: None,
+        requires_user_auth: None,
+        waiting_reason: None,
         waiting_on: vec!["missing-task".into()],
         ..Default::default()
     };
@@ -83,7 +83,7 @@ async fn background_dependencies_validate_session_and_arm_wake() {
         );
     }
     let mut blocked = item.clone();
-    blocked.completely_blocked = Some(crate::todo::TodoCompleteBlocker {
+    blocked.requires_user_auth = Some(crate::todo::TodoUserAuth {
         reason: "Required data is permanently unavailable".into(),
     });
     prepare_background_dependencies(&manager, &session, &[], std::slice::from_ref(&blocked))
@@ -92,9 +92,9 @@ async fn background_dependencies_validate_session_and_arm_wake() {
     let delivery = manager.status(&task.task_id).await.unwrap();
     assert!(
         !delivery.notify && !delivery.wake,
-        "completely blocked todos must retain dependencies without arming delivery"
+        "todos awaiting user authorization keep dependencies without arming delivery"
     );
-    // A peer can still need the same task: the completely blocked condition must
+    // A peer can still need the same task: the authorization pause must
     // not disable delivery for another actionable todo.
     prepare_background_dependencies(&manager, &session, &[], &[blocked, item.clone()])
         .await
@@ -142,8 +142,8 @@ async fn await_dependencies_validate_before_delivery_and_accept_terminal_race() 
     crate::storage::write_json_fast(&path, &state).unwrap();
     let manager = crate::background::BackgroundTaskManager::new();
     let item = TodoItem {
-        completely_blocked: None,
-        external_blocker: None,
+        requires_user_auth: None,
+        waiting_reason: None,
         waiting_on: vec![id.clone()],
         ..Default::default()
     };
@@ -153,8 +153,8 @@ async fn await_dependencies_validate_before_delivery_and_accept_terminal_race() 
             .is_err()
     );
     let invalid = TodoItem {
-        completely_blocked: None,
-        external_blocker: None,
+        requires_user_auth: None,
+        waiting_reason: None,
         waiting_on: vec!["await-unknown-1".into()],
         ..Default::default()
     };
@@ -223,7 +223,7 @@ async fn invalid_background_dependencies_do_not_write_state() {
         let result = TodoTool::new().execute(json!({
             "todos":[{"id":"a", "content":"A", "status":"pending", "priority":"high", "waiting_on":[id]}],
             "plan":{"user_intention":"must not be saved"},
-            "goals":[{"feedback_loop":"must not be saved"}]
+            "goals":[{"feedback_loop":"must not be saved", "delivery_state":"not_started"}]
         }), test_ctx(&session)).await;
         assert!(result.is_err());
         if id.contains(['/', '\\', '.']) {
@@ -260,8 +260,8 @@ async fn missing_historical_dependencies_allow_unrelated_writes_but_not_new_refs
             content: "old".into(),
             status: "completed".into(),
             priority: "high".into(),
-            completely_blocked: None,
-            external_blocker: None,
+            requires_user_auth: None,
+            waiting_reason: None,
             waiting_on: vec!["removed-bg-task".into()],
             ..Default::default()
         },
@@ -451,10 +451,10 @@ async fn an_ungrouped_goal_does_not_survive_into_a_grouped_next_task() {
         json!({
             "todos": [{
                 "content": "flat task one", "status": "in_progress",
-                "priority": "high", "id": "t1", "confidence": 70,
+                "priority": "high", "id": "t1", "confidence": "plausible",
             }],
-            "plan": {"user_intention": "do task one", "understands_user_intent": 97},
-            "goals": [{"closed_feedback_loop": 97, "feedback_loop": "ran the checks"}],
+            "plan": {"user_intention": "do task one", "understands_user_intent": "clear"},
+            "goals": [{"closed_feedback_loop": "closed", "feedback_loop": "ran the checks", "delivery_state": "change_made"}],
         }),
         test_ctx(session),
     )
@@ -472,10 +472,10 @@ async fn an_ungrouped_goal_does_not_survive_into_a_grouped_next_task() {
         json!({
             "todos": [{
                 "content": "task two", "status": "in_progress", "priority": "high",
-                "id": "t2", "group": "second task", "confidence": 70,
+                "id": "t2", "group": "second task", "confidence": "plausible",
             }],
-            "goals": [{"group": "second task", "closed_feedback_loop": 80,
-                       "feedback_loop": "run the new checks"}],
+            "goals": [{"group": "second task", "closed_feedback_loop": "strong",
+                       "delivery_state": "not_started", "feedback_loop": "run the new checks"}],
         }),
         test_ctx(session),
     )
@@ -519,14 +519,14 @@ async fn moving_to_a_new_task_replaces_what_the_todos_panel_shows() {
                 "priority": "high",
                 "id": "t1",
                 "group": "first task",
-                "confidence": 90,
-                "completion_confidence": 97,
+                "confidence": "plausible",
+                "completion_confidence": "validated",
             }],
-            "plan": {"user_intention": "do task one", "understands_user_intent": 97},
+            "plan": {"user_intention": "do task one", "understands_user_intent": "clear"},
             "goals": [{
                 "group": "first task",
-                "closed_feedback_loop": 97,
-                "end_to_end_ownership": 97,
+                "closed_feedback_loop": "closed",
+                "delivery_state": "outcome_delivered",
                 "feedback_loop": "ran the checks",
             }],
         }),
@@ -545,12 +545,12 @@ async fn moving_to_a_new_task_replaces_what_the_todos_panel_shows() {
                 "priority": "high",
                 "id": "t2",
                 "group": "second task",
-                "confidence": 70,
+                "confidence": "plausible",
             }],
             "goals": [{
                 "group": "second task",
-                "closed_feedback_loop": 80,
-                "feedback_loop": "run the new checks",
+                "closed_feedback_loop": "strong",
+                "delivery_state": "not_started", "feedback_loop": "run the new checks",
             }],
         }),
         test_ctx(session),
@@ -598,15 +598,16 @@ async fn a_moderate_first_write_returns_no_continuation_and_records_instead() {
                     "priority": "high",
                     "id": "opt",
                     "group": "speed",
-                    "confidence": 70,
+                    "confidence": "plausible",
                 }],
                 "plan": {
                     "user_intention": "beat the baseline",
-                    "understands_user_intent": 82,
+                    "understands_user_intent": "partial",
                 },
                 "goals": [{
                     "group": "speed",
-                    "closed_feedback_loop": 80,
+                    "delivery_state": "change_made",
+                    "closed_feedback_loop": "strong",
                     "feedback_loop": "run ./grade and read the score",
                     "feedback_loop_relevance": "indirect",
                     "feedback_loop_coverage": "narrow",
@@ -676,7 +677,7 @@ async fn a_moderate_first_write_returns_no_continuation_and_records_instead() {
     // digest now has the trajectory available.
     let output = TodoTool::new()
         .execute(
-            json!({"plan": {"understands_user_intent": 97}}),
+            json!({"plan": {"understands_user_intent": "clear"}}),
             test_ctx(session),
         )
         .await
@@ -729,16 +730,16 @@ async fn low_ownership_completion_is_saved_without_mid_write_rejection() {
                     "priority": "high",
                     "id": "ship",
                     "group": "release",
-                    "confidence": 100,
-                    "completion_confidence": 100,
+                    "confidence": "verified",
+                    "completion_confidence": "verified",
                 }],
                 "goals": [{
                     "group": "release",
-                    "closed_feedback_loop": 100,
+                    "closed_feedback_loop": "closed",
                     "feedback_loop": "run the end-to-end release check",
                     "feedback_loop_relevance": "indirect",
                     "feedback_loop_coverage": "narrow",
-                    "end_to_end_ownership": 95,
+                    "delivery_state": "workflow_validated",
                 }],
             }),
             test_ctx(session),
@@ -753,7 +754,11 @@ async fn low_ownership_completion_is_saved_without_mid_write_rejection() {
     let saved_goal = &saved_goals[0];
     assert_eq!(
         saved_goal.delivery_state,
-        Some(crate::todo::DeliveryState::WorkflowValidated)
+        Some(crate::todo::DeliveryState::Undelivered)
+    );
+    assert_eq!(
+        saved_goal.verification_state,
+        Some(crate::todo::VerificationState::CheckedEndToEnd)
     );
     assert_eq!(
         saved_goal.feedback_loop_relevance,

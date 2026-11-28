@@ -28,6 +28,10 @@ pub(crate) fn handle_auth_command(app: &mut App, trimmed: &str) -> bool {
         .strip_prefix("/login ")
         .or_else(|| trimmed.strip_prefix("/auth "))
     {
+        if crate::provider_catalog::is_auto_api_key_login_alias(provider) {
+            app.start_auto_api_key_login();
+            return true;
+        }
         let providers = crate::provider_catalog::tui_login_providers();
         if let Some(provider) =
             crate::provider_catalog::resolve_login_selection(provider, &providers)
@@ -968,7 +972,7 @@ fn save_openai_compat_setting(app: &mut App, setting: OpenAiCompatSetting, value
                     Some(value) => Some(value),
                     None => {
                         app.push_display_message(DisplayMessage::error(
-                            "OpenAI-compatible API base must be https://... or http://localhost."
+                            "OpenAI-compatible API base must be https://..., or http:// with a localhost/.local name or a bare IP address."
                                 .to_string(),
                         ));
                         return;

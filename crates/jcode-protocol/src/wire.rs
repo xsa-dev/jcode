@@ -22,6 +22,9 @@ pub struct SessionToolDefinition {
 /// Replaces the session SDK overlay. None inherits normal selection.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionToolConfig {
+    /// Session-only instructions owned by the configuring connection, not persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_append: Option<String>,
     #[serde(default)]
     pub enabled: Option<Vec<String>>,
     #[serde(default)]
@@ -34,6 +37,13 @@ pub struct SessionToolConfig {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Request {
+    /// Passive latest-state metadata. Never starts a turn or cancels generation.
+    #[serde(rename = "screen_context")]
+    ScreenContext {
+        id: u64,
+        session_id: String,
+        action: ScreenContextAction,
+    },
     #[serde(rename = "configure_tools")]
     ConfigureTools { id: u64, tools: SessionToolConfig },
     #[serde(rename = "list_tools")]
@@ -51,6 +61,9 @@ pub enum Request {
     Message {
         id: u64,
         content: String,
+        /// Out-of-band client provenance for rendering. Never part of provider input.
+        #[serde(default, skip_serializing_if = "is_false")]
+        jarvis_voice: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<(String, String)>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +91,9 @@ pub enum Request {
     SoftInterrupt {
         id: u64,
         content: String,
+        /// Out-of-band client provenance for rendering. Never part of provider input.
+        #[serde(default, skip_serializing_if = "is_false")]
+        jarvis_voice: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<(String, String)>,
         /// If true, can skip remaining tools at injection point C
@@ -124,6 +140,21 @@ pub enum Request {
     /// Fetch the attached session's todo card without locking its agent.
     #[serde(rename = "get_todos")]
     GetTodos { id: u64 },
+
+    /// Report whether this client's window has focus. Sent only to servers
+    /// that advertise [`crate::CLIENT_FOCUS_CAPABILITY`]; never acknowledged.
+    ///
+    /// `hidden` says an unfocused window is known to be out of sight (another
+    /// workspace, a background multiplexer window, the display off), which
+    /// lets the server batch its stream more coarsely. Absent means not known
+    /// to be hidden, so older clients and servers interoperate unchanged.
+    #[serde(rename = "client_focus")]
+    ClientFocus {
+        id: u64,
+        focused: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        hidden: bool,
+    },
 
     /// Execute a debug command (debug socket only)
     #[serde(rename = "debug_command")]
@@ -182,13 +213,16 @@ pub enum Request {
         allow_session_takeover: bool,
         /// Legacy ownership hint, retained for wire compatibility. Disconnects
         /// only mark a session crashed when they interrupt unfinished processing,
-        /// regardless of this flag. Idle/completed sessions close normally.
+        /// regardless of this flag. Unless continuation is requested,
+        /// idle/completed sessions close normally.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         crash_on_disconnect: bool,
-        /// Keep an already-running turn alive when this transport disconnects.
-        /// Opt-in for remote clients only. Idle sessions still close normally,
-        /// and reattachment uses persisted history plus future live events, not
-        /// replay of missed deltas. This does not survive daemon termination.
+        /// Keep the live session and any running turn when this transport
+        /// disconnects.
+        /// Opt-in for remote clients only. Idle sessions remain available for
+        /// swarm reports and wake turns. Reattachment uses persisted history
+        /// plus future live events, not replay of missed deltas. This does not
+        /// survive daemon termination.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         continue_on_disconnect: bool,
         /// Terminal-identifying env vars (tmux/zellij/kitty/DISPLAY/...) captured
@@ -196,6 +230,9 @@ pub enum Request {
         /// to the client's terminal instead of its own stale startup env (#405).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         terminal_env: Vec<(String, String)>,
+        /// Connecting app name from the API Hello (e.g. `jcode-ios/0.3.0`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_name: Option<String>,
     },
 
     /// Declare that this client is intentionally detaching before its transport
@@ -222,6 +259,9 @@ pub enum Request {
     #[serde(rename = "get_compacted_history")]
     GetCompactedHistory {
         id: u64,
+        /// Expand a recent remote window rather than archived compaction.
+        #[serde(default)]
+        recent_history: bool,
         /// Number of leading compacted messages the client wants rendered before the live tail.
         visible_messages: usize,
     },
@@ -257,6 +297,9 @@ pub enum Request {
         client_has_local_history: bool,
         #[serde(default)]
         allow_session_takeover: bool,
+        /// Connecting app name from the API Hello (e.g. `jcode-ios/0.3.0`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_name: Option<String>,
     },
 
     /// Resume/continue every live session that was interrupted and would
@@ -305,6 +348,15 @@ pub enum Request {
         mode: TranscriptMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+    },
+
+    /// Live push-to-talk state for a TUI session (waveform, live text).
+    /// Fire-and-forget: the server answers `Done` once it has fanned out.
+    #[serde(rename = "voice_activity")]
+    VoiceActivity {
+        id: u64,
+        session_id: String,
+        activity: VoiceActivity,
     },
 
     /// Execute a shell command from `!cmd` in the active remote session.
@@ -890,7 +942,7 @@ pub enum Request {
 }
 
 mod events;
-pub use events::{AccountUsageSnapshot, ServerEvent, TurnIdentity};
+pub use events::{AccountUsageSnapshot, AccountUsageWindow, ServerEvent, TurnIdentity};
 
 impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

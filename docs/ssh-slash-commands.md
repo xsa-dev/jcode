@@ -23,6 +23,16 @@ work. Command failures do not trigger provider fallback or clear an active chat.
 Local daemon mode is distinct from SSH mode and retains its existing behavior.
 Command sequences are not an atomic remote-command API.
 
+## Fork hotkey (Super/Alt+Space)
+
+The next-prompt-to-new-session hotkey works over SSH. Enter sends a daemon
+`Split`, so the fork exists only on the host. The prompt is staged in the
+laptop's client-input file for the new session ID, and a second `jcode --ssh`
+client is opened in a new terminal with the same host, binary, server socket and
+remote working directory. That client attaches and submits the prompt. The
+original terminal stays on the parent session. If no terminal can be opened, the
+exact command is printed instead. No laptop session storage is read or written.
+
 ## Cloud auto-poke ownership
 
 SSH/cloud subscriptions enable the daemon's persisted automatic follow-up policy
@@ -114,6 +124,7 @@ A blocked command must not silently execute against the laptop.
 | `/fork`, `/split`, `/transfer` | Wire | Create a daemon-side child and navigate this terminal only after the matching response. No local child-window launch or VM path lookup. |
 | `/desktop`, `/workspace` | Blocked | Local child-window launch does not yet have a remote-safe Desktop/workspace transport contract. |
 | `/cloud`, `/local` | Coordinated handoff | Cloud orchestration is explicit. Moving an already remote session to cloud is rejected. `/local` coordinates return, not an arbitrary local command fallback. Requires configured cloud authority and successful handoff checks. |
+| `/mobile`, `/mobile cancel` | Cloud handoff and push | Moves the session and its swarm to the account's managed `jcode-cloud` host using the same safety checks as `/cloud`, then sends a session-targeted push. An already-cloud session only sends the push. Tap the notification to open that session in the mobile app. Sign in to the same Jcode account in the CLI and app and enable app notifications. Delivery failures do not undo a successful migration. Cancel stops a queued handoff, not an already-running transfer. |
 | `/quit` | UI | Detach/exit client without overwriting the server's session file. |
 | `/auth` | Runtime | Credential readiness on the VM, without returning secrets. Not a live provider request. |
 | `/logout` | Runtime | Requires `/logout <provider> confirm`. Unconfirmed requests only explain the cleanup scope. Does not revoke external credentials, and live provider instances may retain in-memory credentials until reconnect. |

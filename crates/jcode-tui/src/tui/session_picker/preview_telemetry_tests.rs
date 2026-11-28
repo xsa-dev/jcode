@@ -18,6 +18,7 @@ fn fixture() -> (Session, SessionTelemetry) {
         credential: Some(jcode_provider_core::ResolvedCredential::Oauth),
         account_label: Some("account-a".into()),
         account_usage: Some(crate::protocol::AccountUsageSnapshot {
+            additional_windows: Vec::new(),
             label: "account-a".into(),
             email: None,
             exhausted: false,
@@ -27,6 +28,9 @@ fn fixture() -> (Session, SessionTelemetry) {
             seven_day_ratio: Some(0.5),
             resets_at: None,
             error: None,
+            banked_resets: None,
+            banked_expires_at: None,
+            banked_next_at: None,
         }),
         ..Default::default()
     };
@@ -78,13 +82,16 @@ fn foreign_or_changed_route_snapshots_are_rejected() {
             "provider" => changed.provider_key = Some("different".into()),
             "account" => changed.route_api_method = Some("openai:other".into()),
             _ => {
-                changed.compaction = Some(jcode_session_types::StoredCompactionState {
-                    summary_text: "new summary".into(),
-                    openai_encrypted_content: None,
-                    covers_up_to_turn: 2,
-                    original_turn_count: 3,
-                    compacted_count: 2,
-                })
+                changed.compaction = Some(
+                    jcode_session_types::StoredCompactionState {
+                        summary_text: "new summary".into(),
+                        openai_encrypted_content: None,
+                        covers_up_to_turn: 2,
+                        original_turn_count: 3,
+                        compacted_count: 2,
+                    }
+                    .into(),
+                )
             }
         }
         let data = persisted_info_from_snapshot(&changed, Some(snapshot.clone()));
@@ -125,6 +132,7 @@ fn unattributed_legacy_requests_never_become_current_context_or_quota() {
                 output_tokens: 90_000,
                 cache_read_input_tokens: Some(300_000),
                 cache_creation_input_tokens: None,
+                request_elapsed_ms: None,
             }),
         );
     }

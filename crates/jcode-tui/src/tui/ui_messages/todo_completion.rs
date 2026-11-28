@@ -10,6 +10,105 @@ struct Snapshot {
     todos: Vec<crate::todo::TodoItem>,
     #[serde(default)]
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    plan: CompletionPlan,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct CompletionPlan {
+    #[serde(default)]
+    title: Option<String>,
+}
+
+pub(crate) fn completed_at(msg: &DisplayMessage) -> Option<chrono::DateTime<chrono::Utc>> {
+    if msg.title.as_deref() != Some("Todo completion") || !msg.content.contains("\"completed_at\"") {
+        return None;
+    }
+    let snapshot: Snapshot = serde_json::from_str(&msg.content).ok()?;
+    if snapshot.todo_completion_version != 1 {
+        return None;
+    }
+    snapshot.completed_at
+}
+
+pub(crate) fn format_time_ago_at(
+    time: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let duration = now.signed_duration_since(time);
+    let seconds = duration.num_seconds().max(0);
+    if seconds < 60 {
+        return format!("{}s ago", seconds);
+    }
+    let minutes = duration.num_minutes();
+    if minutes < 60 {
+        return format!("{}m ago", minutes);
+    }
+    let hours = duration.num_hours();
+    if hours < 24 {
+        return format!("{}h ago", hours);
+    }
+    let days = duration.num_days();
+    if days < 7 {
+        return format!("{}d ago", days);
+    }
+    if days < 30 {
+        return format!("{}w ago", days / 7);
+    }
+    format!("{}mo ago", days / 30)
+}
+
+pub(crate) fn next_age_change_delay(
+    completed_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::time::Duration {
+    let secs = now.signed_duration_since(completed_at).num_seconds();
+    if secs < 0 {
+        return std::time::Duration::from_secs(1);
+    }
+    let next_secs = if secs < 60 {
+        secs + 1
+    } else if secs < 3600 {
+        (secs / 60 + 1) * 60
+    } else if secs < 86_400 {
+        (secs / 3600 + 1) * 3600
+    } else {
+        (secs / 86_400 + 1) * 86_400
+    };
+    let next_at = completed_at + chrono::Duration::seconds(next_secs);
+    next_at
+        .signed_duration_since(now)
+        .to_std()
+        .unwrap_or(std::time::Duration::from_secs(1))
+        .max(std::time::Duration::from_millis(50))
+}
+
+/// Update an already-rendered todo completion line's trailing `"  finished ..."`
+/// span in place so cached transcript frames stay live without rebuilding the
+/// body cache.
+pub(crate) fn refresh_age_in_line(
+    line: &mut Line<'static>,
+    completed_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    width: usize,
+) -> bool {
+    let Some(span) = line
+        .spans
+        .iter_mut()
+        .rev()
+        .find(|span| span.content.starts_with("  finished "))
+    else {
+        return false;
+    };
+    span.content = std::borrow::Cow::Owned(format!(
+        "  finished {}",
+        format_time_ago_at(completed_at, now)
+    ));
+    let alignment = line.alignment;
+    let mut updated = super::super::truncate_line_with_ellipsis_to_width(line, width.max(1));
+    updated.alignment = alignment;
+    *line = updated;
+    true
 }
 
 pub(super) fn render(
@@ -49,7 +148,7 @@ fn render_with_gate_diagnostics(
     let width = width.max(1) as usize;
     let mut lines =
         render_finished_todo_summary(&snapshot.todos, "", width, Some("Todo completion"));
-    // Keep the age on the summary row itself so the report stays one line.
+    // Keep the age on the last lane row, below the optional plan heading.
     if let Some(completed_at) = snapshot.completed_at
         && let Some(last) = lines.last_mut()
     {
@@ -62,6 +161,21 @@ fn render_with_gate_diagnostics(
             Style::default().fg(todo_meta_color()),
         ));
         *last = super::super::truncate_line_with_ellipsis_to_width(&Line::from(spans), width);
+    }
+    if let Some(title) = snapshot.plan.title {
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !title.is_empty() {
+            lines.insert(
+                0,
+                super::super::truncate_line_with_ellipsis_to_width(
+                    &Line::from(Span::styled(
+                        title,
+                        Style::default().fg(todo_group_color()).bold(),
+                    )),
+                    width,
+                ),
+            );
+        }
     }
     if show_gate_diagnostics {
         lines.extend(render_gate_categories(&snapshot.observations, width));
@@ -113,6 +227,39 @@ fn render_gate_categories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn todo_completion_plan_title_precedes_lanes_and_age() {
+        let mut msg = DisplayMessage::system(serde_json::json!({
+            "todo_completion_version": 1,
+            "plan": {"title": "  Ship\n界 fix  "},
+            "todos": [
+                {"id":"a", "content":"Hidden", "status":"completed", "priority":"high", "group":"main"},
+                {"id":"b", "content":"Hidden", "status":"completed", "priority":"high", "group":"markdown"}
+            ],
+            "completed_at": chrono::Utc::now()
+        }).to_string());
+        msg.title = Some("Todo completion".into());
+        for width in 1..100 {
+            let lines = render_with_gate_diagnostics(&msg, width, false).unwrap();
+            assert_eq!(lines.len(), 3);
+            assert!(lines.iter().all(|line| line.width() <= width as usize));
+            if width >= 60 {
+                assert_eq!(lines[0].to_string(), "Ship 界 fix");
+                assert!(lines[1].to_string().starts_with("✓ main"));
+                assert!(!lines[1].to_string().contains("finished"));
+                assert!(lines[2].to_string().contains("finished"));
+            }
+        }
+        for title in [serde_json::Value::Null, serde_json::json!(" \n\t ")] {
+            msg.content = serde_json::json!({
+                "todo_completion_version": 1, "plan": {"title": title}
+            })
+            .to_string();
+            let lines = render_with_gate_diagnostics(&msg, 80, false).unwrap();
+            assert_eq!(lines.len(), 1);
+        }
+    }
 
     #[test]
     fn todo_completion_categories_are_unique_and_above_cards() {
@@ -237,7 +384,7 @@ mod tests {
             let mut msg = DisplayMessage::system(serde_json::json!({
                 "todo_completion_version":1,
                 "todos":[{"id":"done","content":"Finished","status":"completed","priority":"high"}],
-                "plan":{"understands_user_intent":"complete","user_intention":intention}
+                "plan":{"understands_user_intent":"clear","user_intention":intention}
             }).to_string());
             msg.title = Some("Todo completion".into());
             let lines = render(&msg, 80, crate::config::DiffDisplayMode::Off).unwrap();
@@ -331,6 +478,43 @@ mod tests {
             }
         }
         assert_eq!(saved, msg.content);
+    }
+
+    #[test]
+    fn todo_completion_refresh_age_in_line_updates_cached_timestamp_and_delays() {
+        let completed_at = chrono::DateTime::parse_from_rfc3339("2026-11-28T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut msg = DisplayMessage::system(
+            serde_json::json!({
+                "todo_completion_version": 1,
+                "todos": [{"id": "a", "content": "Hidden", "status": "completed", "priority": "high", "group": "main"}],
+                "completed_at": completed_at
+            })
+            .to_string(),
+        );
+        msg.title = Some("Todo completion".into());
+        assert_eq!(super::completed_at(&msg), Some(completed_at));
+
+        let mut line = Line::from(vec![
+            Span::raw("✓ main  ●"),
+            Span::styled("  finished 0s ago", Style::default().fg(todo_meta_color())),
+        ]);
+        let five_secs_later = completed_at + chrono::Duration::seconds(5);
+        assert!(refresh_age_in_line(&mut line, completed_at, five_secs_later, 80));
+        assert_eq!(line.to_string(), "✓ main  ●  finished 5s ago");
+        assert_eq!(
+            next_age_change_delay(completed_at, five_secs_later),
+            std::time::Duration::from_secs(1)
+        );
+
+        let two_mins_later = completed_at + chrono::Duration::seconds(125);
+        assert!(refresh_age_in_line(&mut line, completed_at, two_mins_later, 80));
+        assert_eq!(line.to_string(), "✓ main  ●  finished 2m ago");
+        assert_eq!(
+            next_age_change_delay(completed_at, two_mins_later),
+            std::time::Duration::from_secs(55)
+        );
     }
 
     #[test]

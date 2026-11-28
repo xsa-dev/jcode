@@ -202,11 +202,24 @@ fn live_processing_line_uses_real_tokens_transport_and_tool_intent() {
     assert!(!text.contains('\n'));
     status.phase = "streaming".into();
     status.output_tps_milli = Some(12_500);
+    status.status_detail = Some("opening websocket".into());
+    let streaming_line = live_processing_status_line(&status, None, "⠋");
+    let streaming_text = streaming_line.to_string();
     assert!(
-        live_processing_status_line(&status, None, "⠋")
-            .to_string()
-            .contains("12.5 tps")
+        streaming_text.contains("streaming…") && streaming_text.contains("12.5 tps"),
+        "{streaming_text}"
     );
+    assert!(
+        !streaming_text.contains("opening websocket"),
+        "stale websocket-opening detail should not show once streaming: {streaming_text}"
+    );
+    let stalled_line = live_processing_status_line(&status, Some(5.0), "⠋");
+    assert_eq!(stalled_line.spans[1].style.fg, Some(rgb(255, 193, 7)));
+    status.stream_message_ended = true;
+    let finalizing_text = live_processing_status_line(&status, Some(5.0), "⠋").to_string();
+    assert!(finalizing_text.contains("finalizing…"), "{finalizing_text}");
+    status.stream_message_ended = false;
+    status.status_detail = None;
     status.input_tokens = None;
     status.output_tokens = None;
     status.connection_type = None;
@@ -832,5 +845,142 @@ fn normalize_repaint_sensitive_notice_text_drops_warning_variation_selector() {
     assert_eq!(
         normalize_repaint_sensitive_notice_text("all clear"),
         "all clear"
+    );
+}
+
+fn voice_preview(recording: bool, levels: Vec<f32>) -> crate::tui::VoiceComposerPreview {
+    crate::tui::VoiceComposerPreview {
+        recording,
+        elapsed_secs: 7,
+        levels,
+        live: "hello world".into(),
+        hint: "Ctrl+Space send · Esc cancel".into(),
+    }
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+#[test]
+fn voice_waveform_row_never_exceeds_width() {
+    use unicode_width::UnicodeWidthStr;
+    let preview = voice_preview(true, vec![0.1; 64]);
+    for width in [0usize, 5, 12, 20, 40, 80, 200] {
+        let text = line_text(&voice_waveform_line(&preview, width));
+        assert!(text.width() <= width.max(1), "width {width}: {text:?}");
+    }
+    let wide = line_text(&voice_waveform_line(&preview, 120));
+    assert!(
+        wide.contains("0:07") && wide.contains("Esc cancel"),
+        "{wide}"
+    );
+    let narrow = line_text(&voice_waveform_line(&preview, 20));
+    assert!(!narrow.contains("Esc"), "hint dropped first: {narrow}");
+    let transcribing = line_text(&voice_waveform_line(&voice_preview(false, vec![]), 80));
+    assert!(transcribing.contains("Transcribing"), "{transcribing}");
+}
+
+#[test]
+fn voice_waveform_is_newest_on_the_right_and_padded() {
+    let preview = voice_preview(true, vec![0.0, 0.0, 1.0]);
+    let text = line_text(&voice_waveform_line(&preview, 40));
+    assert!(text.contains('·'), "short history pads on the left: {text}");
+    let wave_end = text.trim_end_matches(|c: char| !"▁▂▃▄▅▆▇█".contains(c));
+    assert!(wave_end.ends_with('█'), "{text}");
+}
+
+#[test]
+fn voice_ghost_text_wraps_after_input_without_moving_cursor() {
+    let style = Style::default().italic();
+    let (lines, cursor_line, cursor_col) = wrap_input_text_with_ghost(
+        "fix",
+        3,
+        100,
+        "1",
+        "> ",
+        Color::White,
+        3,
+        &|_| false,
+        Some(("the bug", style)),
+    );
+    assert_eq!((cursor_line, cursor_col), (0, 3));
+    let text = line_text(&lines[0]);
+    assert!(text.ends_with("fix the bug"), "{text}");
+    let ghost = lines[0].spans.last().unwrap();
+    assert_eq!(ghost.content.as_ref(), " the bug");
+    assert!(ghost.style.add_modifier.contains(Modifier::ITALIC));
+}
+
+#[test]
+fn overscroll_omits_duplicate_trailing_effort_suffix_but_keeps_swarm() {
+    let mut facts = OverscrollFacts {
+        machine: None,
+        dir: None,
+        branch: None,
+        git: None,
+        context: None,
+        account_remaining: None,
+        auth: None,
+        provider: Some("Antigravity".to_string()),
+        model: Some("Gemini 4 Neon Low".to_string()),
+        effort: Some("low".to_string()),
+    };
+    let (spans, _) = overscroll_fit_facts(&facts, 80);
+    let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        rendered.contains("Gemini 4 Neon Low") && !rendered.contains("Gemini 4 Neon Low low"),
+        "expected no duplicate effort suffix, got: {rendered}"
+    );
+
+    facts.effort = Some("medium".to_string());
+    let (mismatched_spans, _) = overscroll_fit_facts(&facts, 80);
+    let mismatched_rendered: String = mismatched_spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        mismatched_rendered.contains("Gemini 4 Neon Low")
+            && !mismatched_rendered.contains("Gemini 4 Neon Low medium"),
+        "expected no conflicting effort suffix on effort-named model, got: {mismatched_rendered}"
+    );
+
+    facts.effort = overscroll_short_reasoning("swarm").map(str::to_string);
+    let (swarm_spans, _) = overscroll_fit_facts(&facts, 80);
+    let swarm_rendered: String = swarm_spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        swarm_rendered.contains("Gemini 4 Neon Low")
+            && swarm_rendered.contains(crate::tui::app::effort_display_label("swarm")),
+        "expected swarm effort label to remain visible, got: {swarm_rendered}"
+    );
+}
+
+#[test]
+fn format_last_response_age_only_shows_at_least_one_minute() {
+    use super::status_rendering::format_last_response_age;
+    use std::time::Duration;
+
+    assert_eq!(format_last_response_age(Duration::from_secs(0)), None);
+    assert_eq!(format_last_response_age(Duration::from_secs(59)), None);
+    assert_eq!(
+        format_last_response_age(Duration::from_secs(60)).as_deref(),
+        Some("last response 1m ago")
+    );
+    assert_eq!(
+        format_last_response_age(Duration::from_secs(35 * 60 + 42)).as_deref(),
+        Some("last response 35m ago")
+    );
+    assert_eq!(
+        format_last_response_age(Duration::from_secs(3600)).as_deref(),
+        Some("last response 1h ago")
+    );
+    assert_eq!(
+        format_last_response_age(Duration::from_secs(3600 + 15 * 60)).as_deref(),
+        Some("last response 1h 15m ago")
+    );
+    assert_eq!(
+        format_last_response_age(Duration::from_secs(86_400)).as_deref(),
+        Some("last response 1d ago")
+    );
+    assert_eq!(
+        format_last_response_age(Duration::from_secs(2 * 86_400 + 3 * 3600)).as_deref(),
+        Some("last response 2d 3h ago")
     );
 }

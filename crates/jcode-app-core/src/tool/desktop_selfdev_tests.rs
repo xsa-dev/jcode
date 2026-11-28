@@ -69,6 +69,21 @@ fn builds_both_desktop_packages_with_matching_profile() {
 }
 
 #[test]
+fn schema_advertises_only_one_desktop_rebuild_and_reload_action() {
+    let schema = DesktopSelfDevTool::new().parameters_schema();
+    let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+    assert!(actions.contains(&json!("reload")));
+    assert!(!actions.contains(&json!("build-reload")));
+    assert!(
+        schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("reload rebuilds/reloads Desktop")
+    );
+    assert_eq!(input("build-reload").action, "build-reload");
+}
+
+#[test]
 fn reload_actions_never_route_to_cli_or_subprocess() {
     for action in ["reload", "build-reload"] {
         assert!(command_spec(Path::new("/desktop"), &input(action), "debug", None).is_err());
@@ -236,9 +251,14 @@ async fn process_output_is_bounded() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
-async fn reload_sends_only_r_and_requires_real_acknowledgement() {
+async fn reload_sends_c_and_requires_completion_acknowledgement() {
     use tokio::io::AsyncWriteExt;
-    for reply in [b"ok\n", b"bad"] {
+    let root = checkout();
+    for (reply, expected_ok) in [
+        (&b"ok\n"[..], true),
+        (&b"err:build failed\n"[..], false),
+        (&b"bad\n"[..], false),
+    ] {
         let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
         let mut host = Host {
             path: "test.sock".into(),
@@ -249,10 +269,14 @@ async fn reload_sends_only_r_and_requires_real_acknowledgement() {
         let receiver = tokio::spawn(async move {
             let mut request = [0];
             server.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, b"R");
+            assert_eq!(&request, b"C");
             server.write_all(reply).await.unwrap();
         });
-        assert_eq!(host.reload().await.is_ok(), reply == b"ok\n");
+        let result = host.reload(root.path(), 5).await;
+        assert_eq!(result.is_ok(), expected_ok);
+        if expected_ok {
+            assert_eq!(result.unwrap(), true);
+        }
         receiver.await.unwrap();
     }
 }

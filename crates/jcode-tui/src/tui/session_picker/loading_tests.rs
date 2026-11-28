@@ -1,31 +1,64 @@
 use super::*;
 
-#[test]
-fn preview_loading_preserves_live_tool_duration_metadata() {
-    let mut session = Session::create_with_id("preview_metadata".into(), None, None);
-    session.append_stored_message(crate::session::StoredMessage {
-        id: "tool-result".into(),
-        role: crate::message::Role::User,
-        content: vec![crate::message::ContentBlock::ToolResult {
-            tool_use_id: "tool-call".into(),
-            content: "completed".into(),
-            is_error: None,
-        }],
-        display_role: None,
-        timestamp: None,
-        tool_duration_ms: Some(1250),
-        token_usage: None,
-    });
-    let live = crate::tui::display_messages_from_session(&session);
-    let preview = build_messages_preview(&session);
-    assert_eq!(preview.len(), live.len());
-    let tool = preview.iter().find(|msg| msg.role == "tool").unwrap();
-    assert_eq!(tool.duration_secs, Some(1.25));
-    for (preview, live) in preview.iter().zip(live) {
-        assert_eq!(preview.duration_secs, live.duration_secs);
-        assert_eq!(preview.title, live.title);
-    }
+fn fork_intent_message(text: &str) -> serde_json::Value {
+    serde_json::json!({"role": "user", "content": [{"type": "text", "text": text}]})
 }
+
+const FORK_INTENT_MARKER: &str = "<system-reminder>\nThis session was forked (split) from session flamingo (session_flamingo) by the user.\n</system-reminder>";
+
+#[test]
+#[ignore = "local diagnostic: requires the original penguin and elephant transcripts in ~/.jcode"]
+fn fork_intent_real_penguin_render_search_outranks_desktop_bug() {
+    let _env_lock = crate::storage::lock_test_env();
+    let home = std::env::var_os("HOME").expect("HOME for original saved sessions");
+    let jcode_home = std::path::PathBuf::from(home).join(".jcode");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", &jcode_home);
+    let sessions_dir = jcode_home.join("sessions");
+    let penguin_id = "session_penguin_1794616386487_ec4bb97f1d9ce08c";
+    let elephant_id = "session_elephant_1794614106072_b84529326a638ee9";
+    let catchup = crate::catchup::CatchupSeenSnapshot::load();
+    let penguin = parse_jcode_session_info(&sessions_dir, penguin_id, &catchup)
+        .expect("original saved penguin transcript");
+    let elephant = parse_jcode_session_info(&sessions_dir, elephant_id, &catchup)
+        .expect("original saved Desktop rendering bug transcript");
+    let first_prompt = penguin.first_user_prompt.clone();
+    assert!(
+        first_prompt.as_deref().is_some_and(|prompt| {
+            prompt.starts_with("okay i need a launch video.")
+                && prompt.contains("faithful renders of jcode")
+        }),
+        "penguin must use its fork-local video request, first_prompt={first_prompt:?}"
+    );
+
+    let mut picker = super::super::SessionPicker::new(vec![elephant, penguin]);
+    picker.search_query = "render".into();
+    picker.rebuild_items();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while picker.transcript_search.pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "render search timed out: penguin={:?}, elephant={:?}, first_prompt={first_prompt:?}",
+            picker.transcript_search.rank(penguin_id),
+            picker.transcript_search.rank(elephant_id),
+        );
+        picker.poll_transcript_search();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let visible: Vec<_> = picker
+        .visible_sessions
+        .iter()
+        .map(|reference| picker.session_by_ref(*reference).unwrap().id.clone())
+        .collect();
+    let penguin_position = visible.iter().position(|id| id == penguin_id);
+    let elephant_position = visible.iter().position(|id| id == elephant_id);
+    assert!(
+        matches!((penguin_position, elephant_position), (Some(p), Some(e)) if p < e),
+        "render ranking: visible={visible:?}, penguin={:?}, elephant={:?}, first_prompt={first_prompt:?}",
+        picker.transcript_search.rank(penguin_id),
+        picker.transcript_search.rank(elephant_id),
+    );
+}
+
 use std::path::Path;
 use std::sync::{
     Arc, OnceLock,
@@ -72,171 +105,6 @@ fn write_picker_snapshot(path: &Path, has_messages: bool) {
 }
 
 #[test]
-fn cloud_sessions_are_loaded_outside_the_recent_window_and_grouped_by_host() {
-    let _env_lock = crate::storage::lock_test_env();
-    let temp = tempfile::tempdir().expect("temp dir");
-    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
-    let id = "session_cloudtest_1770000000000";
-    let mut session = Session::create_with_id(id.to_string(), None, Some("Cloud work".into()));
-    session.append_stored_message(crate::session::StoredMessage {
-        id: "msg1".into(),
-        role: crate::message::Role::User,
-        content: vec![crate::message::ContentBlock::Text {
-            text: "Continue my cloud work".into(),
-            cache_control: None,
-        }],
-        display_role: None,
-        timestamp: None,
-        tool_duration_ms: None,
-        token_usage: None,
-    });
-    session.save().expect("save snapshot");
-    let mut lease = storage::SessionLease {
-        session_id: id.into(),
-        epoch: 1,
-        away_host: Some("dev-cloud".into()),
-        repo_root: Some("/workspace/project".into()),
-        last_sync_snapshot: None,
-        last_sync_head: None,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    };
-    storage::write_session_lease(&lease).expect("write lease");
-    let catchup = crate::catchup::CatchupSeenSnapshot::load();
-    let mut sessions = Vec::new();
-    include_cloud_sessions(&temp.path().join("sessions"), &catchup, &mut sessions);
-    assert_eq!(
-        sessions.len(),
-        1,
-        "cloud snapshot is added even without recent candidates"
-    );
-    assert_eq!(sessions[0].server_name.as_deref(), Some("cloud: dev-cloud"));
-    assert!(sessions[0].search_index.contains("cloud dev-cloud"));
-    include_cloud_sessions(&temp.path().join("sessions"), &catchup, &mut sessions);
-    assert_eq!(sessions.len(), 1, "existing snapshots are not duplicated");
-
-    invalidate_session_list_cache();
-    let (groups, orphans) = load_sessions_grouped().expect("group sessions");
-    let group = groups
-        .iter()
-        .find(|group| group.name == "cloud: dev-cloud")
-        .expect("cloud group");
-    assert_eq!(group.icon, "☁");
-    assert!(
-        !group.is_running,
-        "ownership does not imply remote liveness"
-    );
-    assert_eq!(group.sessions[0].id, id);
-    assert!(!orphans.iter().any(|session| session.id == id));
-
-    lease.away_host = None;
-    storage::write_session_lease(&lease).expect("return lease");
-    invalidate_session_list_cache();
-    let (groups, orphans) = load_sessions_grouped().expect("group returned sessions");
-    assert!(!groups.iter().any(|group| group.name == "cloud: dev-cloud"));
-    assert!(
-        orphans
-            .iter()
-            .any(|session| session.id == id && session.server_icon.is_none())
-    );
-}
-
-#[test]
-fn cloud_session_discovery_keeps_missing_snapshots_and_ignores_corrupt_leases() {
-    let _env_lock = crate::storage::lock_test_env();
-    let temp = tempfile::tempdir().expect("temp dir");
-    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
-    let dir = temp.path().join("session_leases");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("broken.json"), "{").unwrap();
-    storage::write_session_lease(&storage::SessionLease {
-        session_id: "session_missing_1770000000000".into(),
-        epoch: 1,
-        away_host: Some("dev-cloud".into()),
-        repo_root: None,
-        last_sync_snapshot: None,
-        last_sync_head: None,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    })
-    .unwrap();
-    let mut sessions = Vec::new();
-    include_cloud_sessions(
-        &temp.path().join("sessions"),
-        &crate::catchup::CatchupSeenSnapshot::load(),
-        &mut sessions,
-    );
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].id, "session_missing_1770000000000");
-    assert_eq!(sessions[0].message_count, 0);
-    assert_eq!(sessions[0].server_name.as_deref(), Some("cloud: dev-cloud"));
-
-    // An empty local migration stub must remain selectable as well.
-    let session = Session::create_with_id("session_missing_1770000000000".into(), None, None);
-    storage::write_json(
-        &crate::session::session_path(&session.id).unwrap(),
-        &session,
-    )
-    .expect("save empty local stub");
-    sessions.clear();
-    include_cloud_sessions(
-        &temp.path().join("sessions"),
-        &crate::catchup::CatchupSeenSnapshot::load(),
-        &mut sessions,
-    );
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].message_count, 0);
-    assert!(sessions[0].title.contains("cloud session"));
-}
-
-#[test]
-fn collect_recent_session_stems_keeps_empty_snapshot_with_journal_history() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let stem = "session_alpha_1770000000000";
-    write_picker_snapshot(&temp.path().join(format!("{stem}.json")), false);
-    std::fs::write(
-        temp.path().join(format!("{stem}.journal.jsonl")),
-        "{\"append_messages\":[{\"role\":\"user\"}]}",
-    )
-    .expect("write journal");
-
-    let stems = collect_recent_session_stems(temp.path(), 1).expect("collect stems");
-    assert_eq!(stems, vec![stem.to_string()]);
-}
-
-#[test]
-fn collect_recent_session_stems_expands_candidate_window_past_recent_empty_stubs() {
-    let temp = tempfile::tempdir().expect("temp dir");
-
-    for idx in 0..30 {
-        let stem = format!("session_empty_{}", 1770000000030u64 - idx as u64);
-        write_picker_snapshot(&temp.path().join(format!("{stem}.json")), false);
-    }
-
-    let older_stem = "session_full_1770000000000";
-    write_picker_snapshot(&temp.path().join(format!("{older_stem}.json")), true);
-
-    let stems = collect_recent_session_stems(temp.path(), 1).expect("collect stems");
-    assert_eq!(stems, vec![older_stem.to_string()]);
-}
-
-#[test]
-fn trivial_hidden_only_snapshot_detector_skips_system_stub() {
-    let bytes = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>boot</system-reminder>"}],"display_role":"system"}]}"#;
-    assert!(snapshot_bytes_look_trivial_hidden_only(bytes));
-}
-
-#[test]
-fn trivial_hidden_only_snapshot_detector_keeps_visible_message() {
-    let bytes = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
-    assert!(!snapshot_bytes_look_trivial_hidden_only(bytes));
-}
-
-#[test]
-fn trivial_hidden_only_snapshot_detector_keeps_system_plus_visible_message() {
-    let bytes = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>boot</system-reminder>"}],"display_role":"system"},{"role":"assistant","content":[{"type":"text","text":"visible"}]}]}"#;
-    assert!(!snapshot_bytes_look_trivial_hidden_only(bytes));
-}
-
-#[test]
 fn global_recency_budget_merges_sources_without_counting_test_sessions() {
     let make = |id: &str, age: i64, source: SessionSource, debug: bool| {
         let now = chrono::Utc::now() - chrono::Duration::seconds(age);
@@ -272,6 +140,7 @@ fn global_recency_budget_merges_sources_without_counting_test_sessions() {
                 session_id: id.into(),
             },
             external_path: None,
+            user_intention: None,
             todo_statuses: Vec::new(),
         }
     };
@@ -298,71 +167,6 @@ fn global_recency_budget_merges_sources_without_counting_test_sessions() {
     limit_sessions_by_recency(&mut sessions, super::super::DEFAULT_SESSION_SCAN_LIMIT);
     assert_eq!(sessions.len(), 500);
     assert!(sessions.iter().all(|s| s.source == SessionSource::Jcode));
-}
-
-#[test]
-fn cached_grouped_sessions_round_trip_from_disk() {
-    let _env_lock = crate::storage::lock_test_env();
-    let temp = tempfile::tempdir().expect("temp dir");
-    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
-    let _scan_limit = EnvVarGuard::set_str("JCODE_SESSION_PICKER_MAX_SESSIONS", "100");
-    let _include_saved = EnvVarGuard::set_str("JCODE_SESSION_PICKER_INCLUDE_OLD_SAVED", "0");
-
-    let sessions_dir = temp.path().join("sessions");
-    std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-    let now = chrono::Utc::now();
-    let session = SessionInfo {
-        id: "session_cache_test_1770000000000".to_string(),
-        parent_id: None,
-        short_name: "cache-test".to_string(),
-        icon: "🧪".to_string(),
-        title: "Cache test".to_string(),
-        message_count: 1,
-        user_message_count: 1,
-        assistant_message_count: 0,
-        created_at: now,
-        last_message_time: now,
-        last_active_at: Some(now),
-        working_dir: Some("/tmp/cache-test".to_string()),
-        model: None,
-        provider_key: None,
-        is_canary: false,
-        is_debug: false,
-        saved: false,
-        save_label: None,
-        status: SessionStatus::Closed,
-        needs_catchup: false,
-        estimated_tokens: 0,
-        first_user_prompt: None,
-        messages_preview: Vec::new(),
-        search_index: "cache test".to_string(),
-        server_name: None,
-        server_icon: None,
-        source: SessionSource::Jcode,
-        resume_target: ResumeTarget::JcodeSession {
-            session_id: "session_cache_test_1770000000000".to_string(),
-        },
-        external_path: None,
-        todo_statuses: Vec::new(),
-    };
-    let cache = GroupedSessionListDiskCache {
-        version: SESSION_LIST_DISK_CACHE_VERSION,
-        generated_at: now,
-        sessions_dir,
-        scan_limit: session_scan_limit(),
-        include_old_saved_sessions: include_old_saved_sessions_on_initial_load(),
-        external_sessions: include_external_sessions(),
-        server_groups: Vec::new(),
-        orphan_sessions: vec![session],
-    };
-
-    let path = session_list_disk_cache_path().expect("cache path");
-    crate::storage::write_json_fast(&path, &cache).expect("write cache");
-
-    let (_groups, orphans) = load_cached_sessions_grouped().expect("load cache");
-    assert_eq!(orphans.len(), 1);
-    assert_eq!(orphans[0].id, "session_cache_test_1770000000000");
-    assert_eq!(orphans[0].title, "Cache test");
 }
 
 #[test]
@@ -395,6 +199,7 @@ fn grouped_refresh_bypasses_fresh_in_process_session_cache() {
 #[test]
 fn recently_closed_session_is_sent_before_cache_and_not_rolled_back() {
     let _env_lock = crate::storage::lock_test_env();
+    let _account = EnvVarGuard::set_str("JCODE_API_KEY", "");
     let temp = tempfile::tempdir().unwrap();
     let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
     let _runtime = EnvVarGuard::set_path("JCODE_RUNTIME_DIR", temp.path());
@@ -430,8 +235,8 @@ fn recently_closed_session_is_sent_before_cache_and_not_rolled_back() {
     );
     session::record_window_closed(id);
     let (sender, receiver) = std::sync::mpsc::channel();
-    send_session_list_updates(sender);
-    for _ in 0..2 {
+    send_session_list_updates_with_discovery(sender, true, || Ok(true));
+    for _ in 0..3 {
         let super::super::SessionListUpdate::Cached((groups, orphans)) = receiver.recv().unwrap()
         else {
             panic!("recent recovery and cache must precede the history refresh");
@@ -455,6 +260,68 @@ fn recently_closed_session_is_sent_before_cache_and_not_rolled_back() {
             .any(|s| s.id == id),
         "bounded history scan must retain recovered session"
     );
+    invalidate_session_list_cache();
+}
+
+#[test]
+fn failed_cloud_refresh_warns_without_discarding_local_or_last_good_cloud_rows() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", home.path());
+    let local_id = "session_cloud_failure_local";
+    let mut session = Session::create_with_id(local_id.into(), None, Some("Local work".into()));
+    session.add_message(
+        Role::User,
+        vec![crate::message::ContentBlock::Text {
+            text: "Keep this local session usable".into(),
+            cache_control: None,
+        }],
+    );
+    session.save().unwrap();
+    let cloud_id = "session_cloud_failure_cached";
+    let lease = storage::SessionLease {
+        session_id: cloud_id.into(),
+        epoch: 5,
+        away_host: Some("jcode-cloud".into()),
+        repo_root: Some("/cloud/cached".into()),
+        last_sync_snapshot: None,
+        last_sync_head: None,
+        updated_at: "2026-11-08T05:00:00Z".into(),
+    };
+    storage::write_session_lease(&lease).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    send_session_list_updates_with_discovery(sender, true, || {
+        anyhow::bail!("synthetic account failure")
+    });
+    let mut warning_seen = false;
+    let mut fresh_seen = false;
+    for update in receiver {
+        match update {
+            super::super::SessionListUpdate::CloudUnavailable(warning) => {
+                assert!(warning.contains("Reopen /resume"));
+                warning_seen = true;
+            }
+            super::super::SessionListUpdate::Fresh(result) => {
+                assert!(
+                    warning_seen,
+                    "explain incomplete discovery before ending refresh"
+                );
+                let (groups, orphans) = result.unwrap();
+                let ids: HashSet<_> = groups
+                    .iter()
+                    .flat_map(|g| g.sessions.iter())
+                    .chain(orphans.iter())
+                    .map(|s| s.id.as_str())
+                    .collect();
+                assert!(ids.contains(local_id));
+                assert!(ids.contains(cloud_id));
+                fresh_seen = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(warning_seen && fresh_seen);
+    assert_eq!(storage::read_session_lease(cloud_id), Some(lease));
     invalidate_session_list_cache();
 }
 
@@ -814,7 +681,8 @@ fn load_sessions_prefers_custom_title_over_generated_title() {
         content: vec![crate::message::ContentBlock::Text {
             text: "please plan the release".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -851,7 +719,8 @@ fn load_sessions_prefers_todo_group_over_generated_title() {
         content: vec![crate::message::ContentBlock::Text {
             text: "please improve the session picker".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -870,17 +739,18 @@ fn load_sessions_prefers_todo_group_over_generated_title() {
         session_id,
         &[crate::todo::TodoItem {
             lane_after: None,
+            lane_owner: None,
             content: "Wire todo title into picker".to_string(),
             status: "in_progress".to_string(),
             priority: "high".to_string(),
             id: "wire-title".to_string(),
             group: Some("Improve resume session names".to_string()),
-            confidence: Some(crate::todo::ConfidenceState::from_legacy_score(90)),
+            confidence: Some(crate::todo::ConfidenceState::Plausible),
             completion_confidence: None,
-            external_blocker: None,
-            completely_blocked: None,
+            waiting_reason: None,
+            requires_user_auth: None,
             waiting_on: Vec::new(),
-            confidence_history: vec![crate::todo::ConfidenceState::from_legacy_score(90)],
+            confidence_history: vec![crate::todo::ConfidenceState::Plausible],
             blocked_by: Vec::new(),
             assigned_to: None,
             stage: None,
@@ -919,13 +789,7 @@ fn load_sessions_prefers_todo_group_over_generated_title() {
         .expect("session with mixed todo statuses");
     assert_eq!(
         loaded.todo_statuses,
-        [
-            "in_progress",
-            "pending",
-            "completed",
-            "cancelled",
-            "future_status"
-        ]
+        ["in_progress", "pending", "completed", "future_status"]
     );
 }
 
@@ -948,7 +812,8 @@ fn load_sessions_keeps_custom_title_over_todo_group() {
         content: vec![crate::message::ContentBlock::Text {
             text: "please improve the session picker".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -959,17 +824,18 @@ fn load_sessions_keeps_custom_title_over_todo_group() {
         session_id,
         &[crate::todo::TodoItem {
             lane_after: None,
+            lane_owner: None,
             content: "Wire todo title into picker".to_string(),
             status: "in_progress".to_string(),
             priority: "high".to_string(),
             id: "wire-title".to_string(),
             group: Some("Automatic todo title".to_string()),
-            confidence: Some(crate::todo::ConfidenceState::from_legacy_score(90)),
+            confidence: Some(crate::todo::ConfidenceState::Plausible),
             completion_confidence: None,
-            external_blocker: None,
-            completely_blocked: None,
+            waiting_reason: None,
+            requires_user_auth: None,
             waiting_on: Vec::new(),
-            confidence_history: vec![crate::todo::ConfidenceState::from_legacy_score(90)],
+            confidence_history: vec![crate::todo::ConfidenceState::Plausible],
             blocked_by: Vec::new(),
             assigned_to: None,
             stage: None,
@@ -1006,7 +872,8 @@ fn load_sessions_caps_saved_sessions_within_global_scan_limit() {
         content: vec![crate::message::ContentBlock::Text {
             text: "keep this bookmarked session visible".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -1026,7 +893,8 @@ fn load_sessions_caps_saved_sessions_within_global_scan_limit() {
             content: vec![crate::message::ContentBlock::Text {
                 text: format!("newer unsaved session {idx:03}"),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             display_role: None,
             timestamp: None,
             tool_duration_ms: None,
@@ -1063,7 +931,8 @@ fn load_sessions_preserves_snapshot_saved_when_journal_meta_omits_saved() {
         content: vec![crate::message::ContentBlock::Text {
             text: "saved session with old journal metadata".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -1150,7 +1019,8 @@ fn session_matches_query_searches_jcode_transcript_contents() {
         content: vec![crate::message::ContentBlock::Text {
             text: "please find the zebra needle hidden in transcript text".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -1195,7 +1065,8 @@ fn jcode_search_index_keeps_late_turns_after_reaching_its_budget() {
             content: vec![crate::message::ContentBlock::Text {
                 text,
                 cache_control: None,
-            }],
+            }]
+            .into(),
             display_role: None,
             timestamp: None,
             tool_duration_ms: None,
@@ -1480,7 +1351,8 @@ fn benchmark_resume_loading_reports_timings() {
             content: vec![crate::message::ContentBlock::Text {
                 text: format!("session {idx:03} says benchmark transcript token zebra-{idx:03}"),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             display_role: None,
             timestamp: None,
             tool_duration_ms: None,
@@ -1492,7 +1364,8 @@ fn benchmark_resume_loading_reports_timings() {
             content: vec![crate::message::ContentBlock::Text {
                 text: "assistant reply for benchmark coverage".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             display_role: None,
             timestamp: None,
             tool_duration_ms: None,
@@ -1531,3 +1404,94 @@ fn benchmark_resume_loading_reports_timings() {
 
 #[path = "loading_scope_tests.rs"]
 mod loading_scope;
+
+#[test]
+fn summary_tracks_newest_message_timestamp_across_roles() {
+    let data: SessionMessageSummaryData = serde_json::from_str(
+        r#"[
+            {"role":"user","content":"hi","timestamp":"2026-01-01T00:00:00Z"},
+            {"role":"assistant","content":"later tool reply","timestamp":"2026-01-01T03:00:00Z"},
+            {"role":"user","content":"no ts"}
+        ]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        data.last_message_at.map(|t| t.to_rfc3339()),
+        Some("2026-01-01T03:00:00+00:00".to_string())
+    );
+
+    let mut base: SessionMessageSummaryData = serde_json::from_str(
+        r#"[{"role":"user","content":"a","timestamp":"2026-01-01T00:00:00Z"}]"#,
+    )
+    .unwrap();
+    base.merge(
+        serde_json::from_str(
+            r#"[{"role":"assistant","content":"b","timestamp":"2026-01-02T00:00:00Z"}]"#,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        base.last_message_at.map(|t| t.to_rfc3339()),
+        Some("2026-01-02T00:00:00+00:00".to_string())
+    );
+}
+
+#[test]
+fn external_previews_index_tool_blocks_at_their_own_weight() {
+    use crate::tui::session_picker::transcript_search::source::{Source, metadata_sources};
+    let temp = tempfile::tempdir().expect("temp dir");
+    let claude = temp.path().join("claude.jsonl");
+    std::fs::write(
+        &claude,
+        concat!(
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"please fix kiwiflake\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"bash\",\"input\":{\"command\":\"grep mangoroot\",\"intent\":\"find papayaplan\"}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"zebradump output\"}]}}\n",
+        ),
+    )
+    .unwrap();
+    let preview = load_claude_code_external_preview(&claude).expect("preview");
+    let index = build_classified_search_index("claude:x", "x", "t", None, None, &preview.search);
+    let tokens: Vec<String> = ["kiwiflake", "mangoroot", "papayaplan", "zebradump"]
+        .map(String::from)
+        .into();
+    assert_eq!(
+        metadata_sources(&[], &index, &tokens),
+        [
+            Some(Source::User),
+            Some(Source::ToolInput),
+            Some(Source::Intent),
+            Some(Source::ToolOutput),
+        ],
+        "{index:?}"
+    );
+
+    let codex = temp.path().join("codex.jsonl");
+    std::fs::write(
+        &codex,
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"c\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"kiwiflake please\"}]}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"arguments\":\"mangoroot\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"output\":\"zebradump\"}}\n",
+        ),
+    )
+    .unwrap();
+    let preview = load_codex_external_preview(&codex).expect("preview");
+    let index = build_classified_search_index("codex:c", "c", "t", None, None, &preview.search);
+    let tokens: Vec<String> = ["kiwiflake", "mangoroot", "zebradump"]
+        .map(String::from)
+        .into();
+    assert_eq!(
+        metadata_sources(&[], &index, &tokens),
+        [
+            Some(Source::User),
+            Some(Source::ToolInput),
+            Some(Source::ToolOutput),
+        ],
+        "{index:?}"
+    );
+}
+
+#[path = "loading_tests_additional_tests.rs"]
+mod additional_fork_intent_snapshot_uses_first_genuine_request_and_keeps_inherited_search;

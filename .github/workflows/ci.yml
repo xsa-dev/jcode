@@ -9,8 +9,10 @@ on:
   pull_request:
     branches: [main, master]
 
+# Release authorization needs completed exact-SHA main-push CI. Keep those
+# runs alive when master advances, while still cancelling obsolete PR checks.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.sha || 'latest' }}
   cancel-in-progress: true
 
 env:
@@ -40,6 +42,10 @@ jobs:
           key: quality-ubuntu
           cache-all-crates: "true"
 
+      - name: Install hosted justrust client
+        if: ${{ secrets.JUSTRUST_API_KEY != '' }}
+        run: bash scripts/install_justrust_hosted_ci.sh
+
       - name: Check module declarations resolve
         # A `mod x;` with no file makes rustfmt fail with "Error writing files:
         # failed to resolve mod", which reads like a formatting problem and hides
@@ -55,11 +61,15 @@ jobs:
 
       - name: Check all targets and all features
         if: ${{ !cancelled() }}
-        run: cargo check --locked --all-targets --all-features
+        env:
+          JCODE_API_KEY: ${{ secrets.JUSTRUST_API_KEY }}
+        run: bash scripts/justrust_ci_run.sh check --locked --all-targets --all-features
 
       - name: Run clippy with warnings denied
         if: ${{ !cancelled() }}
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        env:
+          JCODE_API_KEY: ${{ secrets.JUSTRUST_API_KEY }}
+        run: bash scripts/justrust_ci_run.sh clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Enforce Cargo.lock is up to date
         if: ${{ !cancelled() }}
@@ -111,7 +121,9 @@ jobs:
       - name: Enforce Rust and TypeScript SDK surface parity
         if: ${{ !cancelled() }}
         shell: bash
-        run: cargo test --locked -p jcode-sdk parity -- --nocapture
+        env:
+          JCODE_API_KEY: ${{ secrets.JUSTRUST_API_KEY }}
+        run: bash scripts/justrust_ci_run.sh test --locked -p jcode-sdk parity -- --nocapture
 
       - name: Enforce wildcard re-export ratchet
         if: ${{ !cancelled() }}
@@ -140,24 +152,32 @@ jobs:
           python3 tests/test_ci_workflow_guards.py
           python3 tests/test_install_justrust_ci.py
           python3 tests/test_install_justrust_hosted_ci.py
+          python3 tests/test_justrust_ci_run.py
+          python3 tests/test_publish_linux_release_direct.py
           python3 tests/test_public_release_builds.py
           python3 tests/test_release_ci.py
           python3 scripts/test_safety_budgets.py
           python3 tests/test_bash_platform_guards.py
           python3 scripts/test_quick_release.py
           python3 scripts/test_preview_release.py
+          python3 tests/test_selfdev_linux_workflow.py
+          python3 scripts/test_generate_release_notes.py
+          python3 scripts/test_selfdev_release_highlights.py
+          python3 scripts/test_refresh_selfdev_discord.py
+          python3 scripts/test_compose_before_after.py
+          python3 scripts/test_reconcile_preview_release.py
           python3 tests/test_preview_linux_hosted.py
           python3 tests/test_package_preview_linux_hosted.py
           python3 tests/test_verify_public_release.py
           python3 tests/test_watch_release_run.py
-          bash -n scripts/install_justrust_ci.sh scripts/build_linux_compat.sh scripts/quick-release.sh
+          bash -n scripts/install_justrust_ci.sh scripts/build_linux_compat.sh scripts/quick-release.sh scripts/generate_release_notes.sh
 
       - name: Compile release automation scripts
-        run: python3 -m py_compile scripts/post_discord_release.py scripts/test_post_discord_release.py
+        run: python3 -m py_compile scripts/post_discord_release.py scripts/test_post_discord_release.py scripts/compose_before_after.py scripts/test_compose_before_after.py
 
   build:
     name: Build & Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest' || matrix.os }}
     # 35 minutes covers a normal push (~12 min with a warm Swatinem cache) but
     # not a *rerun*, where the cache is cold: three consecutive reruns of a
     # known-good commit were cancelled at the cap, each getting further through
@@ -203,22 +223,29 @@ jobs:
           components: rust-src
 
       - uses: Swatinem/rust-cache@v2
+        if: ${{ secrets.JUSTRUST_API_KEY == '' }}
         with:
           # Suffix bumped to evict caches that held 1.83.0 / <unknown rustc>
           # artifacts produced before RUSTUP_TOOLCHAIN=stable pinned the job.
           key: ${{ matrix.os }}-stablepin
 
+      - name: Install hosted justrust client
+        if: ${{ secrets.JUSTRUST_API_KEY != '' }}
+        run: bash scripts/install_justrust_hosted_ci.sh
+
       - name: Install mold linker (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && secrets.JUSTRUST_API_KEY == ''
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq mold
 
       - name: Build
         shell: bash
+        env:
+          JCODE_API_KEY: ${{ secrets.JUSTRUST_API_KEY }}
         run: |
           mkdir -p .cargo
-          if [ "$RUNNER_OS" = "Linux" ]; then
+          if [ "$RUNNER_OS" = "Linux" ] && [ -z "${JCODE_API_KEY:-}" ]; then
             cat > .cargo/config.toml << 'EOF'
           [target.x86_64-unknown-linux-gnu]
           linker = "clang"
@@ -235,27 +262,37 @@ jobs:
           RUSTC="$(rustup which rustc)"
           export RUSTC
           CARGO_BIN="$(rustup which cargo)"
-          "$CARGO_BIN" build --locked --release --target ${{ matrix.target }}
+          if [ -n "${JCODE_API_KEY:-}" ] && command -v justrust >/dev/null 2>&1; then
+            bash scripts/justrust_ci_run.sh build --locked --release --target ${{ matrix.target }}
+          else
+            "$CARGO_BIN" build --locked --release --target ${{ matrix.target }}
+          fi
 
       - name: Compile library and binary tests
         shell: bash
+        env:
+          JCODE_API_KEY: ${{ secrets.JUSTRUST_API_KEY }}
         run: |
           python3 .github/scripts/run_with_timeout.py 900 \
-            "$(rustup which cargo)" test --locked --target ${{ matrix.target }} --lib --bins --no-run
+            bash scripts/justrust_ci_run.sh test --locked --target ${{ matrix.target }} --lib --bins --no-run
 
       - name: Run deterministic retention-readiness cohort
         shell: bash
+        env:
+          JCODE_API_KEY: ${{ secrets.JUSTRUST_API_KEY }}
         run: |
           # A cold jcode-app-core test harness compiles heavy optional provider
           # dependencies and can exceed three minutes on hosted runners. The
           # cohort itself runs in under a second once the lib test is built.
           python3 .github/scripts/run_with_timeout.py 600 \
-            "$(rustup which cargo)" test --locked --target ${{ matrix.target }} \
+            bash scripts/justrust_ci_run.sh test --locked --target ${{ matrix.target }} \
             -p jcode-app-core --lib retention_readiness -- --nocapture
 
       - name: Run secret-input pty cohort (all platforms with a pty)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          JCODE_API_KEY: ${{ secrets.JUSTRUST_API_KEY }}
         # `jcode-base --lib` is never executed on Linux CI: the only jcode-base
         # test invocation anywhere in this workflow is a Windows-only
         # `power_inhibit::tests::windows_` filter. So the masking fix for #660 had
@@ -269,7 +306,7 @@ jobs:
         # runner (run 30591536707) while the cohort itself runs in a second.
         run: |
           python3 .github/scripts/run_with_timeout.py 600 \
-            "$(rustup which cargo)" test --locked --target ${{ matrix.target }} \
+            bash scripts/justrust_ci_run.sh test --locked --target ${{ matrix.target }} \
             -p jcode-base --lib secret_input -- --nocapture
 
       - name: Run browser session liveness and reuse regressions
@@ -552,6 +589,18 @@ jobs:
             -Name 'Windows adopted background cancellation tests' `
             -TimeoutSeconds 300 `
             -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '-p', 'jcode-base', '--no-default-features', '--lib', 'background::tests::adopted_task_', '--', '--nocapture')
+
+      - name: Run Windows launcher backup sweep test
+        shell: pwsh
+        run: |
+          # `platform_support.rs` is `#[cfg(windows)]`, so its sweep regression can
+          # only execute on a Windows runner. Without this step the test is
+          # compiled on Windows but never run, which is the same
+          # looks-green-but-never-ran shape the secret-input cohort above calls out.
+          & ./scripts/invoke_cargo_with_timeout.ps1 `
+            -Name 'Windows launcher backup sweep test' `
+            -TimeoutSeconds 300 `
+            -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '-p', 'jcode-build-support', '--lib', 'sweep_removes_only_old_launcher_backups', '--', '--nocapture')
 
       - name: Run Windows e2e smoke tests
         shell: pwsh

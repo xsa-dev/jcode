@@ -239,62 +239,9 @@ pub(super) async fn handle_cycle_model(
     }
 }
 
-fn premium_mode_label(mode: crate::provider::copilot::PremiumMode) -> &'static str {
-    use crate::provider::copilot::PremiumMode;
-    match mode {
-        PremiumMode::Zero => "zero premium requests",
-        PremiumMode::OnePerSession => "one premium per session",
-        PremiumMode::Normal => "normal",
-    }
-}
-
-fn apply_set_premium_mode(
-    id: u64,
-    mode: u8,
-    premium_mode: crate::provider::copilot::PremiumMode,
-    agent: &Agent,
-    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-) {
-    agent.set_premium_mode(premium_mode);
-    crate::logging::info(&format!(
-        "Server: premium mode set to {} ({})",
-        mode,
-        premium_mode_label(premium_mode)
-    ));
-    if let Err(error) = client_event_tx.send(ServerEvent::Ack { id }) {
-        crate::logging::debug(&format!(
-            "Model change acknowledgement client disconnected: {error}"
-        ));
-    }
-}
-
-pub(super) async fn handle_set_premium_mode(
-    id: u64,
-    mode: u8,
-    agent: &Arc<Mutex<Agent>>,
-    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-) {
-    use crate::provider::copilot::PremiumMode;
-
-    let premium_mode = match mode {
-        2 => PremiumMode::Zero,
-        1 => PremiumMode::OnePerSession,
-        _ => PremiumMode::Normal,
-    };
-    if let Ok(agent_guard) = agent.try_lock() {
-        apply_set_premium_mode(id, mode, premium_mode, &agent_guard, client_event_tx);
-    } else {
-        spawn_deferred_agent_mutation(
-            "set_premium_mode",
-            id,
-            Arc::clone(agent),
-            client_event_tx.clone(),
-            move |agent_guard, client_event_tx| {
-                apply_set_premium_mode(id, mode, premium_mode, agent_guard, client_event_tx);
-            },
-        );
-    }
-}
+#[path = "premium_mode_control.rs"]
+mod premium_mode_control;
+pub(super) use premium_mode_control::handle_set_premium_mode;
 
 fn apply_set_model(
     id: u64,
@@ -660,8 +607,14 @@ pub(super) async fn handle_set_reasoning_effort(
     agent: &Arc<Mutex<Agent>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let result = if let Ok(mut agent_guard) = agent.try_lock() {
-        agent_guard.set_reasoning_effort(&effort)
+    let (result, updated_model) = if let Ok(mut agent_guard) = agent.try_lock() {
+        let prev_model = agent_guard.provider_model();
+        let result = agent_guard.set_reasoning_effort(&effort);
+        let updated_model = result
+            .is_ok()
+            .then(|| agent_guard.provider_model())
+            .filter(|new_model| new_model != &prev_model);
+        (result, updated_model)
     } else {
         spawn_deferred_reasoning_effort_change(
             id,
@@ -672,12 +625,13 @@ pub(super) async fn handle_set_reasoning_effort(
         return;
     };
 
-    send_reasoning_effort_result(id, result, client_event_tx);
+    send_reasoning_effort_result(id, result, updated_model, client_event_tx);
 }
 
 fn send_reasoning_effort_result(
     id: u64,
     result: anyhow::Result<Option<String>>,
+    model: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     match result {
@@ -685,6 +639,7 @@ fn send_reasoning_effort_result(
             let _ = client_event_tx.send(ServerEvent::ReasoningEffortChanged {
                 id,
                 effort,
+                model,
                 error: None,
             });
         }
@@ -692,6 +647,7 @@ fn send_reasoning_effort_result(
             let _ = client_event_tx.send(ServerEvent::ReasoningEffortChanged {
                 id,
                 effort: None,
+                model: None,
                 error: Some(e.to_string()),
             });
         }
@@ -708,14 +664,19 @@ fn spawn_deferred_reasoning_effort_change(
     crate::runtime_activity::spawn(async move {
         let mut agent_guard = agent.lock().await;
         log_provider_control_lock_acquired("set_reasoning_effort", id, queued_at);
+        let prev_model = agent_guard.provider_model();
         let result = agent_guard.set_reasoning_effort(&effort);
+        let updated_model = result
+            .is_ok()
+            .then(|| agent_guard.provider_model())
+            .filter(|new_model| new_model != &prev_model);
         crate::logging::info(&format!(
             "Deferred reasoning effort change completed request_id={} requested={} success={}",
             id,
             effort,
             result.is_ok()
         ));
-        send_reasoning_effort_result(id, result, &client_event_tx);
+        send_reasoning_effort_result(id, result, updated_model, &client_event_tx);
         log_provider_control_completed("set_reasoning_effort", id, queued_at);
     });
 }
@@ -930,6 +891,7 @@ pub(super) async fn handle_notify_auth_changed(
             return;
         }
         let activation = crate::auth::lifecycle::activate_auth_change(&activation_request);
+        super::account_usage::request_after_auth_change(id, client_event_tx_clone.clone());
         if let Some(provider_id) = activation.provider_id.as_deref() {
             // A renewed login must get a real request instead of inheriting the
             // previous credential's cached runtime failure.
@@ -1022,6 +984,13 @@ pub(super) async fn handle_notify_auth_changed(
                         let _ = client_event_tx_clone.send(available_models_snapshot_into_event(latest_snapshot.clone()));
                     }
                 }
+                // ModelsUpdated is a catalog-change hint, not a completion wake:
+                // MultiProvider's PendingGuard clears pending without publishing
+                // on failure, and success publishes before the guard drops. An
+                // event-only wait could therefore stall until the 10 s ceiling,
+                // even after successful work. Keep polling until providers expose
+                // a completion notification ordered after clearing pending on
+                // every exit path (including failures and cancellation).
                 _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
             }
         }
@@ -1141,6 +1110,53 @@ pub(super) async fn handle_notify_auth_changed(
         send_catalog_activity(&client_event_tx_clone, &catalog_message);
         finish_auth_refresh(&session_id, auth_refresh_generation);
     });
+    let _ = client_event_tx.send(ServerEvent::Done { id });
+}
+
+/// A one-shot client (the SDK login flow, `jcode login` from another shell)
+/// reports new credentials without subscribing to a session. Refresh every
+/// live session's provider so subscribed clients, including Desktop chats and
+/// drafts that never asked for a session-local switch, receive the new catalog
+/// through `ModelsUpdated`. The post-login model switch stays session-local.
+pub(super) async fn handle_unbound_notify_auth_changed(
+    id: u64,
+    provider_hint: Option<String>,
+    auth: Option<AuthChanged>,
+    provider_template: &Arc<dyn Provider>,
+    sessions: &SessionAgents,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    crate::auth::AuthStatus::invalidate_cache();
+    let activation = crate::auth::lifecycle::activate_auth_change(&AuthActivationRequest::new(
+        provider_hint,
+        auth,
+    ));
+    super::account_usage::request_after_auth_change(id, client_event_tx.clone());
+    if let Some(provider_id) = activation.provider_id.as_deref() {
+        crate::provider::clear_provider_unavailable_for_account(provider_id);
+    }
+    provider_template.on_auth_changed();
+    let agents: Vec<Arc<Mutex<Agent>>> = sessions.read().await.values().cloned().collect();
+    let mut idle = Vec::new();
+    let mut busy = Vec::new();
+    for agent in agents {
+        let handle = agent.try_lock().map(|guard| guard.provider_handle());
+        match handle {
+            Ok(provider) => idle.push(provider),
+            Err(_) => busy.push(agent),
+        }
+    }
+    let mut seen: Vec<Arc<dyn Provider>> = vec![Arc::clone(provider_template)];
+    for provider in idle {
+        if !seen.iter().any(|existing| Arc::ptr_eq(existing, &provider)) {
+            provider.on_auth_changed_preserve_current_provider();
+            seen.push(provider);
+        }
+    }
+    spawn_deferred_auth_refreshes(busy);
+    crate::bus::Bus::global().publish_models_updated();
+    // Catalogs that refresh in the background announce themselves again with
+    // their own ModelsUpdated once the network fetch completes.
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
 

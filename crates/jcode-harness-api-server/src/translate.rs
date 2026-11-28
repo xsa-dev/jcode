@@ -138,6 +138,8 @@ pub struct BridgeState {
     pub crash_on_disconnect: bool,
     /// Client-side inline response renderer, negotiated in Hello.
     pub supports_user_response: bool,
+    /// Client name from Hello, forwarded on subscribe (e.g. `jcode-ios/0.3.0`).
+    pub client_name: Option<String>,
     /// Session id assigned by the daemon for this connection.
     pub session_id: Option<String>,
     /// Legacy id of the in-flight `message` request, so `done` maps to
@@ -210,6 +212,8 @@ pub struct BridgeState {
     current_provider: Option<String>,
     /// Credential the daemon resolved for the session (`oauth`/`api_key`).
     current_credential: Option<String>,
+    /// OAuth account label the daemon routed this session to.
+    current_account: Option<String>,
     /// Reasoning effort last reported by the daemon, so identity events can
     /// carry it without a round trip.
     current_effort: Option<String>,
@@ -594,8 +598,19 @@ impl BridgeState {
                     "supports_server_failover": true,
                     "supports_turn_identity": true,
                 });
+                // Mobile sockets disappear when the OS suspends the app or
+                // changes networks. The daemon must own their session lifetime.
+                // Preserve the existing desktop and unknown SDK client policy.
+                if self.client_name.as_deref().is_some_and(|name| {
+                    matches!(name.split('/').next(), Some("jcode-ios" | "jcode-android"))
+                }) {
+                    subscribe["continue_on_disconnect"] = json!(true);
+                }
                 if self.crash_on_disconnect {
                     subscribe["crash_on_disconnect"] = json!(true);
+                }
+                if let Some(name) = self.client_name.as_deref().filter(|n| !n.is_empty()) {
+                    subscribe["client_name"] = json!(name);
                 }
                 // Sessions rooted inside a jcode checkout are self-dev
                 // sessions: the daemon only enables the self-dev tools and
@@ -1387,71 +1402,12 @@ impl BridgeState {
             ))],
         }
     }
+}
 
-    fn attachment_recovery(event: &Value) -> Option<ServerFrame> {
-        if event["messages"].as_array().is_none_or(Vec::is_empty)
-            || event["activity"]["is_processing"].as_bool() == Some(true)
-        {
-            return None;
-        }
-        let directive = &event["reload_recovery"];
-        let (continuation_message, reconnect_notice) = if let Some(message) =
-            directive["continuation_message"].as_str()
-        {
-            (
-                message.to_string(),
-                directive["reconnect_notice"].as_str().map(str::to_string),
-            )
-        } else if event["was_interrupted"].as_bool() == Some(true) {
-            // Compatibility with daemons predating reload_recovery. Keep in
-            // sync with ReloadContext::interrupted_session_continuation_message.
-            ("Your session was interrupted by a server reload while a tool was running. The tool was aborted and results may be incomplete. Continue exactly where you left off and do not ask the user what to do next.".to_string(), None)
-        } else {
-            return None;
-        };
-        if continuation_message.trim().is_empty() {
-            return None;
-        }
-        Some(ServerFrame::event(ApiEvent::SessionRecovery {
-            session_id: event["session_id"].as_str()?.to_string(),
-            continuation_message,
-            reconnect_notice,
-        }))
-    }
+#[path = "translate_attachment_frames.rs"]
+mod attachment_frames;
 
-    fn applet_frame(session_id: &str, snapshot: &Value) -> Option<ServerFrame> {
-        if session_id.is_empty() {
-            return None;
-        }
-        // Missing means empty; malformed must not clear a valid snapshot.
-        let snapshot = if snapshot.is_null() {
-            jcode_harness_api::jcode_applet_types::AgentApplets::default()
-        } else {
-            serde_json::from_value(snapshot.clone()).ok()?
-        };
-        Some(ServerFrame::event(ApiEvent::AppletState {
-            session_id: session_id.to_string(),
-            snapshot,
-        }))
-    }
-
-    fn side_panel_frame(session_id: &str, snapshot: &Value) -> Option<ServerFrame> {
-        if session_id.is_empty() {
-            return None;
-        }
-        // Missing history state means empty: native history omits empty panels.
-        // Malformed snapshots must not clear a previously valid document.
-        let snapshot = if snapshot.is_null() {
-            jcode_harness_api::SidePanelSnapshot::default()
-        } else {
-            serde_json::from_value(snapshot.clone()).ok()?
-        };
-        Some(ServerFrame::event(ApiEvent::SidePanelState {
-            session_id: session_id.to_string(),
-            snapshot,
-        }))
-    }
-
+impl BridgeState {
     fn text_message_id(&mut self) -> String {
         if let Some(id) = &self.text_message_id {
             return id.clone();
@@ -1829,6 +1785,7 @@ impl BridgeState {
                             self.current_provider = None;
                             self.current_effort = None;
                             self.current_credential = None;
+                            self.current_account = None;
                             self.model_catalog_loaded = false;
                         }
                         if self.session_id.as_deref() != Some(&session_id) {
@@ -2299,6 +2256,7 @@ impl BridgeState {
                                     .unwrap_or(None),
                                 role: m["role"].as_str().unwrap_or("").to_string(),
                                 content: m["content"].as_str().unwrap_or("").to_string(),
+                                tool: Self::history_tool(m),
                             })
                             .collect()
                     })
@@ -2404,6 +2362,7 @@ impl BridgeState {
                     model: self.current_model.clone(),
                     reasoning_effort: self.current_effort.clone(),
                     auth_method: self.current_credential.clone(),
+                    account_label: self.current_account.clone(),
                 };
                 // Both a reply and a broadcast: the caller needs its request
                 // resolved, and every other client watching the session needs
@@ -2424,8 +2383,15 @@ impl BridgeState {
                 // none (e.g. `none` normalised away), which is also a change.
                 let changed = event["error"].as_str().is_none() && {
                     let effort = event["effort"].as_str().map(str::to_string);
-                    let moved = self.current_effort != effort;
+                    let model = event["model"].as_str().map(str::to_string);
+                    let moved = self.current_effort != effort
+                        || model
+                            .as_ref()
+                            .is_some_and(|m| self.current_model.as_ref() != Some(m));
                     self.current_effort = effort;
+                    if let Some(model) = model {
+                        self.current_model = Some(model);
+                    }
                     moved
                 };
                 // A successful change is also broadcast as identity, mirroring
@@ -2438,6 +2404,7 @@ impl BridgeState {
                         model: self.current_model.clone(),
                         reasoning_effort: self.current_effort.clone(),
                         auth_method: self.current_credential.clone(),
+                        account_label: self.current_account.clone(),
                     })
                 });
                 let Some(api_id) = self.take_simple(id, SimpleKind::ReasoningEffort) else {
@@ -2828,6 +2795,13 @@ impl BridgeState {
         if let Some(credential) = event.get("resolved_credential") {
             self.current_credential = credential.as_str().map(str::to_string);
         }
+        if let Some(label) = event.get("provider_oauth_account_label") {
+            self.current_account = label
+                .as_str()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string);
+        }
     }
 
     fn runtime_info(&self) -> ApiEvent {
@@ -2837,6 +2811,7 @@ impl BridgeState {
             model: self.current_model.clone(),
             reasoning_effort: self.current_effort.clone(),
             auth_method: self.current_credential.clone(),
+            account_label: self.current_account.clone(),
             routes: self.available_routes.clone(),
         }
     }
@@ -2851,6 +2826,7 @@ impl BridgeState {
                 .map(str::to_string)
                 .or_else(|| self.current_effort.clone()),
             auth_method: self.current_credential.clone(),
+            account_label: self.current_account.clone(),
         }
     }
 
@@ -3447,6 +3423,7 @@ impl BridgeState {
                     response_stats: None,
                     role: role.to_string(),
                     content,
+                    tool: None,
                 })
             })
             .take(limit)

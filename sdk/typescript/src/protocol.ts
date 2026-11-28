@@ -92,6 +92,8 @@ export interface TodoSnapshot {
   long_session_review_due: boolean;
   /** Session-scoped background task IDs still running. Absent on older servers. */
   running_background_tasks?: string[];
+  /** Assigned worker sessions confirmed to own a live turn by the daemon. */
+  running_workers?: string[];
 }
 
 /** Persistent effects of a follow-up decision. */
@@ -389,6 +391,8 @@ export type ApiEvent =
       model?: string;
       reasoning_effort?: string;
       auth_method?: string;
+      /** OAuth account the daemon's account router selected. */
+      account_label?: string;
     }
   | { ev: "models"; session_id: string; models: string[]; current?: string }
   | {
@@ -398,6 +402,8 @@ export type ApiEvent =
       model?: string;
       reasoning_effort?: string;
       auth_method?: string;
+      /** OAuth account the daemon's account router selected. */
+      account_label?: string;
       routes: ModelRouteInfo[];
     }
   | { ev: "credential_updated"; provider: string; configured: boolean }

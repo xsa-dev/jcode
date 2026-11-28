@@ -18,10 +18,9 @@ pub(super) enum Multiplexer {
     Tmux,
     Screen,
     Zellij,
-    /// herdr.dev agent multiplexer. Advertises `TERM=xterm-256color`,
-    /// `TERM_PROGRAM=herdr`, and `HERDR_ENV=1` in every pane while emulating
-    /// panes with libghostty (Kitty graphics) and forwarding placements to
-    /// capable outer terminals.
+    /// herdr.dev agent multiplexer. Advertises `TERM=xterm-256color` and sets
+    /// `HERDR_ENV=1` in every pane, hiding the outer terminal. Recent versions
+    /// can pass kitty graphics through to a capable outer terminal.
     Herdr,
 }
 
@@ -50,21 +49,9 @@ pub(super) fn detect_multiplexer(
     zellij: Option<&str>,
     herdr_env: Option<&str>,
 ) -> Multiplexer {
-    let term = term.unwrap_or("");
+    // Herdr wins first: it rewrites TERM to a bland value but always exports
+    // HERDR_ENV=1, so it is the most specific signal.
     if env_is_set(herdr_env) {
-        // Herdr strips ZELLIJ and STY and resets TERM to xterm-256color when
-        // spawning a pane, while an outer TMUX variable can still leak in.
-        // Any ZELLIJ, STY, or screen*/tmux* TERM therefore comes from an
-        // inner multiplexer started inside the Herdr pane.
-        if env_is_set(zellij) {
-            return Multiplexer::Zellij;
-        }
-        if term.starts_with("tmux") {
-            return Multiplexer::Tmux;
-        }
-        if env_is_set(sty) || term.starts_with("screen") {
-            return Multiplexer::Screen;
-        }
         return Multiplexer::Herdr;
     }
     if env_is_set(zellij) {
@@ -73,6 +60,7 @@ pub(super) fn detect_multiplexer(
     if env_is_set(tmux) {
         return Multiplexer::Tmux;
     }
+    let term = term.unwrap_or("");
     if env_is_set(sty) || term.starts_with("screen") {
         return Multiplexer::Screen;
     }
@@ -281,7 +269,6 @@ pub(super) fn infer_protocol_from_env(
     }
 
     if term.contains("kitty")
-        || term.contains("ghostty")
         || term_program.contains("kitty")
         || term_program.contains("ghostty")
         || term_program.contains("handterm")
@@ -315,25 +302,6 @@ pub(super) fn infer_protocol_from_env(
     }
 
     None
-}
-
-/// Resolve the fast-path image protocol from environment hints and multiplexer
-/// identity.
-///
-/// Herdr emulates every pane with libghostty (`GhosttyPaneTerminal`), which
-/// speaks the Kitty graphics protocol and translates visible placements to the
-/// outer terminal (including Ghostty and WezTerm), while stripping outer
-/// terminal identity vars (`LC_TERMINAL`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`).
-/// Select `ProtocolType::Kitty` when Herdr is the active multiplexer (not when
-/// an inner multiplexer like Zellij, tmux, or screen is running inside Herdr).
-pub(super) fn resolve_env_protocol(
-    env_protocol: Option<ProtocolType>,
-    multiplexer: Multiplexer,
-) -> Option<ProtocolType> {
-    if multiplexer == Multiplexer::Herdr {
-        return Some(ProtocolType::Kitty);
-    }
-    env_protocol
 }
 
 /// True when we are running in real iTerm2 (not WezTerm, which also speaks the
@@ -385,7 +353,7 @@ fn query_font_size() -> (u16, u16) {
     }
 }
 
-fn fast_picker_with_protocol(protocol: Option<ProtocolType>) -> Picker {
+fn fast_picker() -> Picker {
     // Use the real cell size from the terminal. Building the picker with the
     // hardcoded halfblocks default (10x20) makes every cell<->pixel conversion
     // wrong on HiDPI displays: images get scaled for 20px rows while Kitty
@@ -398,22 +366,16 @@ fn fast_picker_with_protocol(protocol: Option<ProtocolType>) -> Picker {
     // deliberately keep it to stay correct on HiDPI terminals.
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(font_size);
-    picker.set_protocol_type(protocol.unwrap_or(ProtocolType::Halfblocks));
+    picker.set_protocol_type(ProtocolType::Halfblocks);
+    if let Some(protocol) = infer_protocol_from_env(
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("LC_TERMINAL").ok().as_deref(),
+        std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+    ) {
+        picker.set_protocol_type(protocol);
+    }
     picker
-}
-
-fn fast_picker() -> Picker {
-    let multiplexer = detect_multiplexer_from_env();
-    let env_protocol = resolve_env_protocol(
-        infer_protocol_from_env(
-            std::env::var("TERM").ok().as_deref(),
-            std::env::var("TERM_PROGRAM").ok().as_deref(),
-            std::env::var("LC_TERMINAL").ok().as_deref(),
-            std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
-        ),
-        multiplexer,
-    );
-    fast_picker_with_protocol(env_protocol)
 }
 
 /// Build a picker via the authoritative stdio capability probe.
@@ -482,16 +444,13 @@ pub(crate) fn prewarm_svg_font_db_async() {
 /// in-memory cache registration.
 pub fn init_picker() {
     PICKER.get_or_init(|| {
-        let multiplexer = detect_multiplexer_from_env();
-        let env_protocol = resolve_env_protocol(
-            infer_protocol_from_env(
-                std::env::var("TERM").ok().as_deref(),
-                std::env::var("TERM_PROGRAM").ok().as_deref(),
-                std::env::var("LC_TERMINAL").ok().as_deref(),
-                std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
-            ),
-            multiplexer,
+        let env_protocol = infer_protocol_from_env(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            std::env::var("LC_TERMINAL").ok().as_deref(),
+            std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
         );
+        let multiplexer = detect_multiplexer_from_env();
         let probe_override = std::env::var("JCODE_MERMAID_PICKER_PROBE")
             .ok()
             .as_deref()
@@ -510,7 +469,7 @@ pub fn init_picker() {
             probe_override
         ));
         let mut picker = match mode {
-            PickerInitMode::Fast => fast_picker_with_protocol(env_protocol),
+            PickerInitMode::Fast => fast_picker(),
             PickerInitMode::Probe => probe_picker(),
         };
         apply_multiplexer_protocol_limits(&mut picker, multiplexer);
@@ -640,6 +599,13 @@ pub fn get_cached_png(hash: u64) -> Option<(PathBuf, u32, u32)> {
 /// Register a local markdown image, rasterizing SVGs for terminal protocols.
 /// SVG cache keys include the source bytes so edited graphs never reuse old pixels.
 pub fn register_markdown_image(path: &Path) -> Option<u64> {
+    register_markdown_image_with_dims(path).map(|(hash, _, _)| hash)
+}
+
+/// Register a local Markdown image (raster or SVG) in the render cache and
+/// return `(hash, width, height)` in pixels so inline chat renderers can size
+/// the terminal placeholder box accurately.
+pub fn register_markdown_image_with_dims(path: &Path) -> Option<(u64, u32, u32)> {
     if !path.extension()?.eq_ignore_ascii_case("svg") {
         let (width, height) = image::image_dimensions(path).map_or_else(
             |error| {
@@ -648,7 +614,8 @@ pub fn register_markdown_image(path: &Path) -> Option<u64> {
             },
             Some,
         )?;
-        return Some(register_external_image(path, width, height));
+        let hash = register_external_image(path, width, height);
+        return Some((hash, width, height));
     }
 
     let bytes = fs::read(path).map_or_else(
@@ -715,7 +682,8 @@ pub fn register_markdown_image(path: &Path) -> Option<u64> {
         },
         Some,
     )?;
-    Some(register_external_image(&output, width, height))
+    let hash = register_external_image(&output, width, height);
+    Some((hash, width, height))
 }
 
 /// Register an external image file (e.g. from file_read) in the render cache

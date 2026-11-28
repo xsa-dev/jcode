@@ -8,20 +8,24 @@ pub const DEFAULT_OPENAI_MODEL: &str = "gpt-6.1-sol";
 ///
 /// NOTE: The Mythos preview family was retired by Anthropic and 404s, so it is
 /// intentionally NOT listed here. `claude-fable-5` was briefly retired but is
-/// live again. Opus 5.5 launched 2026-09-22. The list is curated best-first;
+/// live again. Opus 5.5 launched 2026-09-22 and `claude-fable-5-2` on
+/// 2026-11-09. The list is curated best-first;
 /// position 0 is the flagship used for post-login default selection.
 pub const ALL_CLAUDE_MODELS: &[&str] = &[
     "claude-opus-5-5",
     DEFAULT_CLAUDE_MODEL,
     "claude-opus-5",
+    "claude-fable-5-2",
     "claude-fable-5-1",
     "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-6",
     "claude-opus-4-6[1m]",
+    "claude-sonnet-5-5",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
     "claude-sonnet-4-6[1m]",
+    "claude-haiku-5-5",
     "claude-haiku-4-5",
     "claude-opus-4-5",
     "claude-sonnet-4-5",
@@ -168,47 +172,6 @@ fn model_id_for_capability_lookup(model: &str, provider: Option<&str>) -> (Strin
     (lookup, is_1m)
 }
 
-fn is_antigravity_short_gemini4_alias(model: &str) -> bool {
-    matches!(
-        model,
-        "neon"
-            | "neon-low"
-            | "neon-medium"
-            | "neon-high"
-            | "neon-xhigh"
-            | "hydrogen"
-            | "hydrogen-low"
-            | "hydrogen-medium"
-            | "hydrogen-high"
-            | "hydrogen-xhigh"
-            | "argon"
-            | "argon-low"
-            | "argon-medium"
-            | "argon-high"
-            | "carbon"
-            | "carbon-low"
-            | "carbon-medium"
-            | "carbon-high"
-    )
-}
-
-fn is_gemini_long_context_model(model: &str) -> bool {
-    if model.starts_with("gemini-2.0-flash")
-        || model.starts_with("gemini-2.5")
-        || model == "gemini-pro-agent"
-        || is_antigravity_short_gemini4_alias(model)
-    {
-        return true;
-    }
-    if let Some(rest) = model.strip_prefix("gemini-") {
-        let major_digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-        if let Ok(major) = major_digits.parse::<u32>() {
-            return major >= 3;
-        }
-    }
-    false
-}
-
 fn copilot_context_limit_for_model(model: &str) -> usize {
     match model {
         "claude-sonnet-4" | "claude-sonnet-4-6" | "claude-sonnet-4.6" => 128_000,
@@ -221,7 +184,10 @@ fn copilot_context_limit_for_model(model: &str) -> usize {
         m if m.starts_with("gpt-4.1") => 128_000,
         m if m.starts_with("gpt-5") => 128_000,
         "o3-mini" | "o4-mini" => 128_000,
-        m if is_gemini_long_context_model(m) => 1_000_000,
+        m if m.starts_with("gemini-2.0-flash") => 1_000_000,
+        m if m.starts_with("gemini-2.5") => 1_000_000,
+        m if m.starts_with("gemini-3") => 1_000_000,
+        m if m.starts_with("gemini-4") => 1_000_000,
         _ => 128_000,
     }
 }
@@ -250,8 +216,6 @@ pub fn provider_for_model_with_hint(
         Some("claude")
     } else if model.starts_with("gpt-") {
         Some("openai")
-    } else if is_antigravity_short_gemini4_alias(&model.to_ascii_lowercase()) {
-        Some("antigravity")
     } else if model.starts_with("gemini-") {
         Some("gemini")
     } else {
@@ -310,33 +274,9 @@ pub fn context_limit_for_model_with_provider_and_cache(
     };
     let foreign_ids_on_custom_endpoint =
         raw_model_had_vendor_prefix && !endpoint_is_anthropic_or_gateway;
-    let prefix_stripped_hint = crate::selection::explicit_model_provider_prefix(
-        &model.trim().to_ascii_lowercase(),
-    )
-    .map(|(active, _, _)| match active {
-        crate::selection::ActiveProvider::Claude => "claude",
-        crate::selection::ActiveProvider::OpenAI => "openai",
-        crate::selection::ActiveProvider::Copilot => "copilot",
-        crate::selection::ActiveProvider::Antigravity => "antigravity",
-        crate::selection::ActiveProvider::Gemini => "gemini",
-        crate::selection::ActiveProvider::Cursor => "cursor",
-        crate::selection::ActiveProvider::Bedrock => "bedrock",
-        crate::selection::ActiveProvider::OpenRouter => "openrouter",
-    });
-    let provider = provider_key_from_hint(provider_hint)
-        .or(prefix_stripped_hint)
-        .or_else(|| provider_for_model(model));
-    let (raw_lookup, is_1m) = model_id_for_capability_lookup(model, provider);
-    let stripped_lookup =
-        crate::selection::explicit_model_provider_prefix(&raw_lookup).map(|(_, _, rest)| {
-            let rest = rest.trim();
-            if matches!(provider, Some("openrouter")) || rest.contains('/') {
-                crate::model_id::slash_base(rest).to_string()
-            } else {
-                rest.to_string()
-            }
-        });
-    let model = stripped_lookup.as_deref().unwrap_or(raw_lookup.as_str());
+    let provider = provider_key_from_hint(provider_hint).or_else(|| provider_for_model(model));
+    let (model, is_1m) = model_id_for_capability_lookup(model, provider);
+    let model = model.as_str();
 
     if matches!(provider, Some("copilot")) {
         return Some(copilot_context_limit_for_model(model));
@@ -366,12 +306,7 @@ pub fn context_limit_for_model_with_provider_and_cache(
     // Honor an explicitly configured/cached context limit before applying broad
     // model-family fallbacks (e.g. custom openai-compatible providers may serve
     // GPT-named models with different context windows). See issue #541.
-    if let Some(limit) = cached_context_limit(raw_lookup.as_str()) {
-        return Some(limit);
-    }
-    if model != raw_lookup.as_str()
-        && let Some(limit) = cached_context_limit(model)
-    {
+    if let Some(limit) = cached_context_limit(model) {
         return Some(limit);
     }
 
@@ -399,7 +334,11 @@ pub fn context_limit_for_model_with_provider_and_cache(
         return Some(272_000);
     }
 
-    if is_gemini_long_context_model(model) {
+    if model.starts_with("gemini-2.0-flash")
+        || model.starts_with("gemini-2.5")
+        || model.starts_with("gemini-3")
+        || model.starts_with("gemini-4")
+    {
         return Some(1_000_000);
     }
 
@@ -645,6 +584,31 @@ mod tests {
             ALL_OPENAI_MODELS.first().copied(),
             Some(DEFAULT_OPENAI_MODEL)
         );
+    }
+
+    /// Regression: a live Claude model missing from the bundled list has no
+    /// Claude OAuth/API route until the account catalog has been fetched, so
+    /// the picker could only offer it through some other provider that lists
+    /// the same id (a user picking Fable 5.2 landed on an OpenAI-compatible
+    /// endpoint instead of their Claude subscription).
+    #[test]
+    fn bundled_claude_list_covers_live_generations() {
+        for model in ["claude-fable-5-2", "claude-sonnet-5-5", "claude-haiku-5-5"] {
+            assert!(ALL_CLAUDE_MODELS.contains(&model), "{model} missing");
+            assert_eq!(provider_for_model(model), Some("claude"), "{model}");
+            assert_eq!(
+                context_limit_for_model_with_provider(model, Some("claude")),
+                Some(1_000_000),
+                "{model}"
+            );
+            assert_eq!(
+                crate::anthropic::anthropic_max_output_tokens(model),
+                128_000,
+                "{model}"
+            );
+        }
+        let position = |model: &str| ALL_CLAUDE_MODELS.iter().position(|m| *m == model);
+        assert!(position("claude-fable-5-2") < position("claude-fable-5-1"));
     }
 
     #[test]
@@ -957,103 +921,6 @@ mod tests {
             context_limit_for_model_with_provider("gemini-2.5-pro", Some("copilot")),
             Some(1_000_000)
         );
-        assert_eq!(
-            context_limit_for_model_with_provider("gemini-4-carbon-medium", Some("copilot")),
-            Some(1_000_000)
-        );
-        assert_eq!(
-            context_limit_for_model_with_provider("gemini-4-argon-medium", Some("copilot")),
-            Some(1_000_000)
-        );
-    }
-
-    #[test]
-    fn context_limit_and_provider_hint_handle_gemini_4_carbon_and_argon() {
-        for short_alias in [
-            "neon",
-            "neon-low",
-            "neon-medium",
-            "neon-high",
-            "neon-xhigh",
-            "hydrogen",
-            "hydrogen-low",
-            "hydrogen-medium",
-            "hydrogen-high",
-            "hydrogen-xhigh",
-            "argon",
-            "argon-low",
-            "argon-medium",
-            "argon-high",
-            "carbon",
-            "carbon-low",
-            "carbon-medium",
-            "carbon-high",
-        ] {
-            assert_eq!(
-                provider_for_model(short_alias),
-                Some("antigravity"),
-                "expected short alias {short_alias} to hint antigravity"
-            );
-        }
-        for model in [
-            "neon",
-            "neon-low",
-            "neon-medium",
-            "neon-high",
-            "neon-xhigh",
-            "hydrogen",
-            "hydrogen-low",
-            "hydrogen-medium",
-            "hydrogen-high",
-            "hydrogen-xhigh",
-            "argon",
-            "argon-low",
-            "argon-medium",
-            "argon-high",
-            "carbon",
-            "carbon-low",
-            "carbon-medium",
-            "carbon-high",
-            "gemini-4-neon",
-            "gemini-4-neon-low",
-            "gemini-4-neon-medium",
-            "gemini-4-neon-high",
-            "gemini-4-neon-xhigh",
-            "gemini-4-hydrogen",
-            "gemini-4-hydrogen-low",
-            "gemini-4-hydrogen-medium",
-            "gemini-4-hydrogen-high",
-            "gemini-4-hydrogen-xhigh",
-            "gemini-4-argon",
-            "gemini-4-argon-low",
-            "gemini-4-argon-medium",
-            "gemini-4-argon-high",
-            "gemini-4-carbon",
-            "gemini-4-carbon-low",
-            "gemini-4-carbon-medium",
-            "gemini-4-carbon-high",
-            "antigravity:gemini-4-neon-xhigh",
-            "antigravity:neon-high",
-            "antigravity:gemini-4-hydrogen-xhigh",
-            "antigravity:hydrogen-high",
-            "antigravity:gemini-4-carbon-medium",
-            "antigravity:carbon-high",
-            "antigravity:gemini-4-argon-medium",
-            "gemini:gemini-4-argon-high",
-            "gemini-pro-agent",
-            "gemini-5-pro",
-        ] {
-            assert_eq!(
-                context_limit_for_model(model),
-                Some(1_000_000),
-                "expected 1M context window for {model}"
-            );
-            assert_eq!(
-                context_limit_for_model_with_provider(model, Some("antigravity")),
-                Some(1_000_000),
-                "expected 1M context window for {model} on antigravity"
-            );
-        }
     }
 
     #[test]
